@@ -1,0 +1,9 @@
+machine_id,machine_group,machine_name,daily_capacity_minutes,efficiency,can_preempt
+M_CUT_01,CUT,M CUT 01,540,0.925,False
+M_CUT_02,CUT,M CUT 02,540,1.04,False
+M_WELD_01,WELD,M WELD 01,540,0.996,False
+M_WELD_02,WELD,M WELD 02,540,0.97,False
+M_PAINT_01,PAINT,M PAINT 01,540,0.881,False
+M_ASSY_01,ASSY,M ASSY 01,540,0.881,False
+M_ASSY_02,ASSY,M ASSY 02,540,0.862,False
+M_PACK_01,PACK,M PACK 01,540,1.023,False

@@ -1,0 +1,5 @@
+scenario_name,description,machine_id,event_start,estimated_duration_minutes,actual_duration_minutes
+baseline_no_disruption,Initial plan without machine stoppage,,,0,0
+optimistic_estimate,Stoppage initially estimated as 5 minutes,M_WELD_01,2026-04-20 10:30:00,5,20
+pessimistic_estimate,Stoppage initially estimated as 20 minutes,M_WELD_01,2026-04-20 10:30:00,20,20
+updated_after_10_min,"Initial estimate 5 min, then updated to 20 min after 10 min",M_WELD_01,2026-04-20 10:30:00,5,20

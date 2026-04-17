@@ -1,0 +1,4 @@
+event_id,machine_id,event_start,estimated_duration_minutes,actual_duration_minutes,reason,scenario_name
+DT_001,M_WELD_01,2026-04-20 10:30:00,5,20,unexpected_micro_stoppage,optimistic_estimate
+DT_002,M_WELD_01,2026-04-20 10:30:00,20,20,unexpected_micro_stoppage,pessimistic_estimate
+DT_003,M_WELD_01,2026-04-20 10:30:00,5,20,unexpected_micro_stoppage,updated_after_10_min

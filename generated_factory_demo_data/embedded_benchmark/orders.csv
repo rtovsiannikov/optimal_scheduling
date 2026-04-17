@@ -1,0 +1,7 @@
+order_id,product_family,priority,priority_label,release_time,deadline,customer_segment
+B_001,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:15:00,benchmark
+B_002,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:05:00,benchmark
+B_003,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:15:00,benchmark
+B_004,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:10:00,benchmark
+B_005,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:10:00,benchmark
+B_006,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:10:00,benchmark
