@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QDoubleSpinBox,
     QSplitter,
@@ -154,11 +155,18 @@ class MainWindow(QMainWindow):
         root_layout.addWidget(header)
 
         splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(self._build_sidebar())
+
+        sidebar_scroll = QScrollArea()
+        sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setFrameShape(QFrame.NoFrame)
+        sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        sidebar_scroll.setWidget(self._build_sidebar())
+
+        splitter.addWidget(sidebar_scroll)
         splitter.addWidget(self._build_main_area())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([340, 1160])
+        splitter.setSizes([360, 1140])
         root_layout.addWidget(splitter, stretch=1)
 
         self.setCentralWidget(root)
@@ -193,6 +201,7 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         panel.setMinimumWidth(320)
         panel.setMaximumWidth(420)
+        panel.setMinimumHeight(920)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(8)
@@ -283,6 +292,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.kpi_panel)
 
         self.tabs = QTabWidget()
+        self.tabs.setUsesScrollButtons(True)
+        self.tabs.setDocumentMode(True)
         self.baseline_gantt = GanttView()
         self.replanned_gantt = GanttView()
         self.compare_table = DataFrameTable()
