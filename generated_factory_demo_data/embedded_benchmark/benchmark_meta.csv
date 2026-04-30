@@ -1,2 +1,2 @@
-instance_name,num_orders,num_operations
-embedded_benchmark_small,6,18
+instance_name,num_orders,num_operations,total_quantity
+embedded_benchmark_small_mto_otif_batch_split,6,45,40

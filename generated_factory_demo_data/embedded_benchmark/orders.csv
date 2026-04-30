@@ -1,7 +1,7 @@
-order_id,product_family,priority,priority_label,release_time,deadline,customer_segment
-B_001,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:15:00,benchmark
-B_002,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:05:00,benchmark
-B_003,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:15:00,benchmark
-B_004,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:10:00,benchmark
-B_005,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:10:00,benchmark
-B_006,BENCHMARK,3,normal,2026-04-20 08:00:00,2026-04-20 10:10:00,benchmark
+order_id,product_family,order_type,order_quantity,target_batch_size,num_batches,priority,priority_label,release_time,deadline,promised_date,customer_segment
+B_001,BENCHMARK,MTO,7,3,3,3,normal,2026-04-20 08:00:00,2026-04-20 14:49:00,2026-04-20 14:49:00,benchmark
+B_002,BENCHMARK,MTO,6,3,2,3,normal,2026-04-20 08:00:00,2026-04-20 13:31:00,2026-04-20 13:31:00,benchmark
+B_003,BENCHMARK,MTO,8,3,3,3,normal,2026-04-20 08:00:00,2026-04-20 14:33:00,2026-04-20 14:33:00,benchmark
+B_004,BENCHMARK,MTO,5,3,2,3,normal,2026-04-20 08:00:00,2026-04-20 13:10:00,2026-04-20 13:10:00,benchmark
+B_005,BENCHMARK,MTO,9,3,3,3,normal,2026-04-20 08:00:00,2026-04-20 14:54:00,2026-04-20 14:54:00,benchmark
+B_006,BENCHMARK,MTO,5,3,2,3,normal,2026-04-20 08:00:00,2026-04-20 13:19:00,2026-04-20 13:19:00,benchmark
