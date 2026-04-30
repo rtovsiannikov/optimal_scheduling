@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
 from .compare_view import build_change_table, build_kpi_comparison, build_machine_utilization
 from .gantt_view import GanttView
 from .kpi_cards import KpiPanel
+from .legend_window import OrderLegendWindow
 from .models import AppState, ObjectiveWeights, SolverSettings
 from .scheduler_service import SchedulerService
 from .table_views import DataFrameTable
@@ -130,6 +131,9 @@ class MainWindow(QMainWindow):
         self.service = SchedulerService(repo_root)
         self.active_thread: Optional[QThread] = None
         self.active_worker: Optional[Worker] = None
+        self.is_solver_running = False
+        self.run_failed = False
+        self.legend_window: Optional[OrderLegendWindow] = None
         self.progress_timer = QTimer(self)
         self.progress_timer.setInterval(500)
         self.progress_timer.timeout.connect(self._update_progress)
@@ -149,8 +153,11 @@ class MainWindow(QMainWindow):
         open_action.triggered.connect(self.choose_bundle)
         export_action = QAction("Export latest results", self)
         export_action.triggered.connect(self.export_results)
+        legend_action = QAction("Show order legend", self)
+        legend_action.triggered.connect(self.show_order_legend)
         self.menuBar().addAction(open_action)
         self.menuBar().addAction(export_action)
+        self.menuBar().addAction(legend_action)
 
     def _build_ui(self) -> None:
         root = QWidget()
@@ -270,6 +277,9 @@ class MainWindow(QMainWindow):
         self.export_button = QPushButton("Export results")
         self.export_button.setObjectName("SecondaryButton")
         self.export_button.clicked.connect(self.export_results)
+        self.legend_button = QPushButton("Show order legend")
+        self.legend_button.setObjectName("SecondaryButton")
+        self.legend_button.clicked.connect(self.show_order_legend)
 
         self.progress_label = QLabel("Idle")
         self.progress_label.setStyleSheet("color: #5a6472; font-size: 11px;")
@@ -282,6 +292,7 @@ class MainWindow(QMainWindow):
         actions_layout.addWidget(self.solve_button)
         actions_layout.addWidget(self.reschedule_button)
         actions_layout.addWidget(self.export_button)
+        actions_layout.addWidget(self.legend_button)
         actions_layout.addSpacing(6)
         actions_layout.addWidget(self.progress_label)
         actions_layout.addWidget(self.progress_bar)
@@ -323,14 +334,29 @@ class MainWindow(QMainWindow):
         self.solver_log = QTextEdit()
         self.solver_log.setReadOnly(True)
 
-        self.tabs.addTab(self.baseline_gantt, "Baseline Plan")
-        self.tabs.addTab(self.replanned_gantt, "Rescheduled Plan")
+        self.tabs.addTab(self._wrap_scrollable(self.baseline_gantt), "Baseline Plan")
+        self.tabs.addTab(self._wrap_scrollable(self.replanned_gantt), "Rescheduled Plan")
         self.tabs.addTab(self._build_compare_tab(), "Compare")
         self.tabs.addTab(self.orders_table, "Orders")
         self.tabs.addTab(self.machines_table, "Machines")
         self.tabs.addTab(self._build_diagnostics_tab(), "Diagnostics")
         layout.addWidget(self.tabs, stretch=1)
         return area
+
+    def _wrap_scrollable(self, widget: QWidget) -> QScrollArea:
+        """Wrap large visual widgets in a scroll area.
+
+        This keeps the Gantt chart usable when the application is not maximized:
+        the chart keeps a readable minimum size and the user can scroll inside
+        the tab instead of losing the bottom/right part of the plot.
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(widget)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setFrameShape(QFrame.NoFrame)
+        return scroll
 
     def _build_compare_tab(self) -> QWidget:
         widget = QWidget()
@@ -467,6 +493,28 @@ class MainWindow(QMainWindow):
         self.append_log(f"Exported results to: {output}")
         self.statusBar().showMessage(f"Exported results to {output}")
 
+    @Slot()
+    def show_order_legend(self) -> None:
+        color_map = self._build_shared_order_color_map()
+        if not color_map:
+            QMessageBox.information(self, "Legend is empty", "Solve a baseline plan first to create the order color legend.")
+            return
+
+        if self.legend_window is None:
+            self.legend_window = OrderLegendWindow(self)
+
+        orders_df = None
+        if self.state.bundle is not None:
+            orders_df = self.state.bundle.orders
+        self.legend_window.set_mapping(color_map, orders_df)
+        self.legend_window.show()
+        self.legend_window.raise_()
+        self.legend_window.activateWindow()
+
+        # Move the legend next to the main application window where possible.
+        geometry = self.geometry()
+        self.legend_window.move(geometry.x() + max(40, geometry.width() - 560), geometry.y() + 120)
+
     def _read_solver_settings(self) -> SolverSettings:
         weights = ObjectiveWeights(
             missed_otif_penalty=int(self.missed_otif_spin.value()),
@@ -490,9 +538,11 @@ class MainWindow(QMainWindow):
         return True
 
     def _run_in_thread(self, fn: Callable[[], object], on_success: Callable[[object], None], busy_message: str) -> None:
-        if self.active_thread is not None:
+        if self.is_solver_running or self.active_thread is not None:
             QMessageBox.information(self, "Solver is already running", "Wait until the current solve finishes.")
             return
+        self.is_solver_running = True
+        self.run_failed = False
         self._set_busy(True)
         self._start_progress(busy_message, float(self.time_limit_spin.value()))
         self.statusBar().showMessage(busy_message)
@@ -518,6 +568,12 @@ class MainWindow(QMainWindow):
         self.solve_button.setDisabled(busy)
         self.reschedule_button.setDisabled(busy)
         self.export_button.setDisabled(busy)
+        if hasattr(self, "legend_button"):
+            self.legend_button.setDisabled(busy)
+        self.solve_button.setText("Solver is running..." if busy else "Solve baseline plan")
+        self.reschedule_button.setText("Solver is running..." if busy else "Run rescheduling")
+        if hasattr(self, "legend_button"):
+            self.legend_button.setDisabled(busy)
         self.solve_button.setText("Solver is running..." if busy else "Solve baseline plan")
         self.reschedule_button.setText("Solver is running..." if busy else "Run rescheduling")
 
@@ -533,7 +589,7 @@ class MainWindow(QMainWindow):
         self.progress_timer.start()
 
     def _update_progress(self) -> None:
-        if self.active_thread is None:
+        if not self.is_solver_running:
             return
         self.progress_elapsed_seconds += self.progress_timer.interval() / 1000.0
         pct = min(99, int(100.0 * self.progress_elapsed_seconds / max(1.0, self.progress_limit_seconds)))
@@ -551,13 +607,16 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _clear_active_thread(self) -> None:
-        self._finish_progress(success=True)
+        if not self.run_failed:
+            self._finish_progress(success=True)
         self.active_thread = None
         self.active_worker = None
+        self.is_solver_running = False
         self._set_busy(False)
 
     @Slot(str)
     def _on_worker_failed(self, error_text: str) -> None:
+        self.run_failed = True
         self._finish_progress(success=False)
         self.status_label.setText("Status: failed")
         self.statusBar().showMessage("Solver failed. See Diagnostics tab.")

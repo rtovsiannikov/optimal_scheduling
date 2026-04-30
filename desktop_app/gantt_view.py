@@ -7,6 +7,7 @@ from typing import Dict, Optional
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as NavigationToolbar
+from matplotlib.colors import to_hex
 from matplotlib.dates import DateFormatter, date2num
 from matplotlib.figure import Figure
 from PySide6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
@@ -30,7 +31,7 @@ class GanttView(QWidget):
 
         # Do not force a huge widget height: the chart must fit inside
         # the tab area on laptops and projectors.
-        self.setMinimumHeight(420)
+        self.setMinimumSize(1180, 500)
         self.plot_empty("No schedule yet")
 
     def plot_empty(self, message: str) -> None:
@@ -143,11 +144,11 @@ class GanttView(QWidget):
         """Build a deterministic color map for order IDs.
 
         The same order_id gets the same color in baseline and rescheduled plots.
-        Matplotlib's default Tableau palette is repeated when there are more
-        than 10 orders.
+        The colors are returned as hex values, so the same mapping can also be
+        shown in the Qt legend window.
         """
         unique_order_ids = sorted({str(order_id) for order_id in order_ids if str(order_id) and str(order_id).lower() != "nan"})
-        color_cycle = [f"C{i % 10}" for i in range(max(1, len(unique_order_ids)))]
+        color_cycle = [to_hex(f"C{i % 10}") for i in range(max(1, len(unique_order_ids)))]
         return {order_id: color_cycle[i] for i, order_id in enumerate(unique_order_ids)}
 
     @staticmethod
