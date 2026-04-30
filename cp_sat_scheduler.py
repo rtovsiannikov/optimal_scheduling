@@ -1,11 +1,26 @@
+"""CP-SAT scheduler and event-driven rescheduler for MTO/JIT factory scheduling.
 
-"""
-CP-SAT scheduler and event-driven rescheduler for the generated factory demo data.
+This version extends the original demo model with order quantities and OTIF-oriented
+business logic:
 
-Designed to work with the data bundle produced by:
-factory_scheduling_data_generator.ipynb
+- each order may have an ``order_quantity``;
+- orders may be split into several production batches/lots;
+- each batch follows the same routing independently, which allows partial completion by the promised date;
+- MTO orders are prioritized in the objective;
+- an order is OTIF only when the full ordered quantity is completed by its promised date;
+- missed quantity by the promised date, tardiness, makespan, and preferred-machine assignment are secondary objectives.
+
+Expected CSV bundle produced by ``factory_scheduling_data_generator.ipynb``:
+
+- machines.csv
+- shifts.csv
+- orders.csv
+- operations.csv
+- downtime_events.csv
+- scenarios.csv
 
 Main entry points:
+
 - load_data_bundle(bundle_dir)
 - solve_schedule(bundle_dir, scenario_name="baseline_no_disruption")
 - run_reschedule_on_event(bundle_dir, baseline_schedule_df, scenario_name, ...)
@@ -18,7 +33,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
-
 import math
 import time
 
@@ -29,6 +43,7 @@ from ortools.sat.python import cp_model
 # ---------------------------------------------------------------------
 # Data containers
 # ---------------------------------------------------------------------
+
 
 @dataclass
 class DataBundle:
@@ -54,17 +69,19 @@ class SolveResult:
 # Helpers
 # ---------------------------------------------------------------------
 
+
 def _ensure_datetime(df: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
     df = df.copy()
-    for c in columns:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce")
+    for column in columns:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], errors="coerce")
     return df
 
 
 def _coerce_bool_series(series: pd.Series) -> pd.Series:
     if pd.api.types.is_bool_dtype(series):
         return series.fillna(False)
+
     mapping = {
         "true": True,
         "false": False,
@@ -77,8 +94,139 @@ def _coerce_bool_series(series: pd.Series) -> pd.Series:
     return normalized.fillna(False)
 
 
+def _normalize_orders(orders: pd.DataFrame) -> pd.DataFrame:
+    """Make the scheduler backward-compatible with older generated datasets."""
+    orders = orders.copy()
+
+    if "order_id" in orders.columns:
+        orders["order_id"] = orders["order_id"].astype(str)
+
+    if "order_quantity" not in orders.columns:
+        orders["order_quantity"] = 1
+    orders["order_quantity"] = (
+        pd.to_numeric(orders["order_quantity"], errors="coerce").fillna(1).clip(lower=1).astype(int)
+    )
+
+    if "order_type" not in orders.columns:
+        orders["order_type"] = "MTO"
+    orders["order_type"] = orders["order_type"].fillna("MTO").astype(str).str.upper()
+
+    # promised_date is the business name; deadline is kept for compatibility.
+    if "promised_date" not in orders.columns and "deadline" in orders.columns:
+        orders["promised_date"] = orders["deadline"]
+    if "deadline" not in orders.columns and "promised_date" in orders.columns:
+        orders["deadline"] = orders["promised_date"]
+
+    orders = _ensure_datetime(orders, ["release_time", "deadline", "promised_date"])
+    return orders
+
+
+def _normalize_operations(operations: pd.DataFrame, orders: pd.DataFrame) -> pd.DataFrame:
+    """Add derived duration fields expected by the MTO/OTIF batch-splitting model.
+
+    New batch-splitting datasets contain one operation row per order-batch-routing step.
+    The important columns are:
+
+    - ``batch_id``: production lot identifier inside the customer order;
+    - ``batch_index``: numeric lot index used for stable sorting;
+    - ``batch_quantity`` / ``operation_quantity``: quantity processed by this lot;
+    - ``unit_processing_time_minutes``: run time per unit;
+    - ``processing_time_minutes``: pure run time for this lot;
+    - ``setup_time_minutes``: fixed setup time for this lot operation;
+    - ``total_duration_minutes``: interval duration used by CP-SAT.
+
+    Older datasets without batch columns remain valid: each order is treated as one
+    batch with ``batch_quantity == operation_quantity == order_quantity``.
+    """
+    operations = operations.copy()
+    orders = _normalize_orders(orders)
+
+    if "operation_id" in operations.columns:
+        operations["operation_id"] = operations["operation_id"].astype(str)
+    if "order_id" in operations.columns:
+        operations["order_id"] = operations["order_id"].astype(str)
+
+    order_qty_map = orders.set_index("order_id")["order_quantity"].to_dict()
+
+    if "batch_id" not in operations.columns:
+        operations["batch_id"] = operations["order_id"].astype(str) + "_B001"
+    operations["batch_id"] = operations["batch_id"].astype(str)
+
+    if "batch_index" not in operations.columns:
+        extracted = operations["batch_id"].str.extract(r"_B(\d+)$")[0]
+        operations["batch_index"] = pd.to_numeric(extracted, errors="coerce").fillna(1).astype(int)
+    else:
+        operations["batch_index"] = (
+            pd.to_numeric(operations["batch_index"], errors="coerce").fillna(1).clip(lower=1).astype(int)
+        )
+
+    if "batch_quantity" not in operations.columns:
+        if "operation_quantity" in operations.columns:
+            operations["batch_quantity"] = operations["operation_quantity"]
+        else:
+            operations["batch_quantity"] = operations["order_id"].map(order_qty_map).fillna(1)
+
+    operations["batch_quantity"] = (
+        pd.to_numeric(operations["batch_quantity"], errors="coerce").fillna(1).clip(lower=1).astype(int)
+    )
+
+    if "operation_quantity" not in operations.columns:
+        operations["operation_quantity"] = operations["batch_quantity"]
+    operations["operation_quantity"] = (
+        pd.to_numeric(operations["operation_quantity"], errors="coerce").fillna(operations["batch_quantity"]).clip(lower=1).astype(int)
+    )
+
+    if "setup_time_minutes" not in operations.columns:
+        operations["setup_time_minutes"] = 0
+    operations["setup_time_minutes"] = (
+        pd.to_numeric(operations["setup_time_minutes"], errors="coerce").fillna(0).clip(lower=0).astype(int)
+    )
+
+    if "unit_processing_time_minutes" not in operations.columns:
+        # Old datasets only have processing_time_minutes. In that case treat
+        # processing_time_minutes as the full run time and infer a diagnostic
+        # per-unit value without changing the original duration.
+        old_processing = pd.to_numeric(operations.get("processing_time_minutes", 0), errors="coerce").fillna(0).clip(lower=0)
+        operations["unit_processing_time_minutes"] = (
+            old_processing / operations["operation_quantity"].replace(0, 1)
+        ).round().clip(lower=0).astype(int)
+
+    operations["unit_processing_time_minutes"] = (
+        pd.to_numeric(operations["unit_processing_time_minutes"], errors="coerce")
+        .fillna(0)
+        .clip(lower=0)
+        .astype(int)
+    )
+
+    if "processing_time_minutes" not in operations.columns:
+        operations["processing_time_minutes"] = (
+            operations["unit_processing_time_minutes"] * operations["operation_quantity"]
+        )
+    else:
+        operations["processing_time_minutes"] = (
+            pd.to_numeric(operations["processing_time_minutes"], errors="coerce")
+            .fillna(0)
+            .clip(lower=0)
+            .astype(int)
+        )
+
+    if "total_duration_minutes" not in operations.columns:
+        operations["total_duration_minutes"] = (
+            operations["processing_time_minutes"] + operations["setup_time_minutes"]
+        )
+    operations["total_duration_minutes"] = (
+        pd.to_numeric(operations["total_duration_minutes"], errors="coerce")
+        .fillna(operations["processing_time_minutes"] + operations["setup_time_minutes"])
+        .clip(lower=1)
+        .astype(int)
+    )
+
+    operations = _ensure_datetime(operations, ["release_time", "deadline", "promised_date"])
+    return operations
+
+
 def load_data_bundle(bundle_dir: str | Path) -> DataBundle:
-    """Load a data bundle from a folder such as synthetic_demo or embedded_benchmark."""
+    """Load and normalize a scheduler data bundle."""
     bundle_dir = Path(bundle_dir)
 
     machines = pd.read_csv(bundle_dir / "machines.csv")
@@ -88,8 +236,8 @@ def load_data_bundle(bundle_dir: str | Path) -> DataBundle:
     downtime_events = pd.read_csv(bundle_dir / "downtime_events.csv")
     scenarios = pd.read_csv(bundle_dir / "scenarios.csv")
 
-    orders = _ensure_datetime(orders, ["release_time", "deadline"])
-    operations = _ensure_datetime(operations, ["release_time", "deadline"])
+    orders = _normalize_orders(orders)
+    operations = _normalize_operations(operations, orders)
     shifts = _ensure_datetime(shifts, ["shift_start", "shift_end"])
     downtime_events = _ensure_datetime(downtime_events, ["event_start"])
     scenarios = _ensure_datetime(scenarios, ["event_start"])
@@ -113,14 +261,14 @@ def _time_origin(bundle: DataBundle) -> pd.Timestamp:
         bundle.orders["release_time"].min(),
         bundle.operations["release_time"].min(),
     ]
-    candidates = [c for c in candidates if pd.notna(c)]
+    candidates = [candidate for candidate in candidates if pd.notna(candidate)]
     if not candidates:
         raise ValueError("Could not determine time origin from the bundle.")
     return min(candidates)
 
 
 def _to_minute(value: pd.Timestamp, origin: pd.Timestamp) -> int:
-    return int((value - origin).total_seconds() // 60)
+    return int((pd.to_datetime(value) - origin).total_seconds() // 60)
 
 
 def _from_minute(value: int, origin: pd.Timestamp) -> pd.Timestamp:
@@ -134,15 +282,33 @@ def _machine_group_map(machines: pd.DataFrame) -> Dict[str, List[str]]:
     return out
 
 
+def _merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
+    cleaned = [(int(start), int(end)) for start, end in intervals if int(end) > int(start)]
+    if not cleaned:
+        return []
+
+    cleaned = sorted(cleaned)
+    merged = [cleaned[0]]
+    for start, end in cleaned[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end:
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
 def _shift_lookup(shifts: pd.DataFrame, origin: pd.Timestamp) -> Dict[str, List[Tuple[int, int]]]:
     lookup: Dict[str, List[Tuple[int, int]]] = {}
     working_mask = shifts["is_working"] if "is_working" in shifts.columns else pd.Series([True] * len(shifts))
-    shifts = shifts[working_mask == True].copy()
-    for _, row in shifts.iterrows():
+    working_shifts = shifts[working_mask == True].copy()
+
+    for _, row in working_shifts.iterrows():
         machine_id = str(row["machine_id"])
         start = _to_minute(row["shift_start"], origin)
         end = _to_minute(row["shift_end"], origin)
         lookup.setdefault(machine_id, []).append((start, end))
+
     for machine_id in lookup:
         lookup[machine_id] = _merge_intervals(sorted(lookup[machine_id]))
     return lookup
@@ -172,24 +338,10 @@ def _downtime_intervals_for_scenario(
         duration = int(row[duration_col])
         end = start + duration
         out.setdefault(str(row["machine_id"]), []).append((start, end))
+
     for machine_id in list(out.keys()):
         out[machine_id] = _merge_intervals(out[machine_id])
     return out
-
-
-def _merge_intervals(intervals: List[Tuple[int, int]]) -> List[Tuple[int, int]]:
-    cleaned = [(int(s), int(e)) for s, e in intervals if int(e) > int(s)]
-    if not cleaned:
-        return []
-    cleaned = sorted(cleaned)
-    merged = [cleaned[0]]
-    for s, e in cleaned[1:]:
-        ls, le = merged[-1]
-        if s <= le:
-            merged[-1] = (ls, max(le, e))
-        else:
-            merged.append((s, e))
-    return merged
 
 
 def _subtract_intervals(
@@ -206,14 +358,14 @@ def _subtract_intervals(
     result: List[Tuple[int, int]] = []
     for start, end in base:
         cursor = start
-        for b_start, b_end in blocked:
-            if b_end <= cursor:
+        for blocked_start, blocked_end in blocked:
+            if blocked_end <= cursor:
                 continue
-            if b_start >= end:
+            if blocked_start >= end:
                 break
-            if cursor < b_start:
-                result.append((cursor, min(b_start, end)))
-            cursor = max(cursor, b_end)
+            if cursor < blocked_start:
+                result.append((cursor, min(blocked_start, end)))
+            cursor = max(cursor, blocked_end)
             if cursor >= end:
                 break
         if cursor < end:
@@ -226,15 +378,12 @@ def _finish_time_in_available_windows(
     required_work_minutes: int,
     available_windows: Iterable[Tuple[int, int]],
 ) -> int:
-    """
-    Compute finish time when processing may only happen inside available_windows.
-    """
+    """Compute finish time when processing may only happen inside availability windows."""
     if required_work_minutes <= 0:
         return int(start_minute)
 
     remaining = int(required_work_minutes)
     current = int(start_minute)
-
     for window_start, window_end in _merge_intervals(list(available_windows)):
         if window_end <= current:
             continue
@@ -254,11 +403,7 @@ def _finish_time_in_available_windows(
 
 
 def _priority_weight_map(orders: pd.DataFrame) -> Dict[str, int]:
-    """
-    Convert order priority into a penalty weight.
-    Lower numeric priority is treated as more urgent, which matches the demo data
-    where 1=critical and larger numbers are less urgent.
-    """
+    """Convert order priority into a penalty/benefit weight."""
     if orders.empty:
         return {}
 
@@ -280,10 +425,8 @@ def _priority_weight_map(orders: pd.DataFrame) -> Dict[str, int]:
                 unresolved_rows.append(row)
         if not unresolved_rows:
             return weights
-        # Fill any unresolved rows from the numeric priority fallback.
         unresolved_df = pd.DataFrame(unresolved_rows)
-        numeric_weights = _priority_weight_map_from_numeric(unresolved_df)
-        weights.update(numeric_weights)
+        weights.update(_priority_weight_map_from_numeric(unresolved_df))
         return weights
 
     return _priority_weight_map_from_numeric(orders)
@@ -292,24 +435,35 @@ def _priority_weight_map(orders: pd.DataFrame) -> Dict[str, int]:
 def _priority_weight_map_from_numeric(orders: pd.DataFrame) -> Dict[str, int]:
     if "priority" not in orders.columns:
         return {str(row["order_id"]): 1 for _, row in orders.iterrows()}
+
     priority_series = pd.to_numeric(orders["priority"], errors="coerce")
     min_priority = int(priority_series.min()) if priority_series.notna().any() else 1
     max_priority = int(priority_series.max()) if priority_series.notna().any() else 1
     span = max_priority - min_priority
+
     weights: Dict[str, int] = {}
     for _, row in orders.iterrows():
         order_id = str(row["order_id"])
         try:
-            p = int(row["priority"])
+            priority = int(row["priority"])
         except Exception:
             weights[order_id] = 1
             continue
-        # Example: priorities 1..3 -> weights 3,2,1
-        weights[order_id] = (max_priority - p + 1) if span >= 0 else 1
+        # Example: priorities 1..4 -> weights 4,3,2,1.
+        weights[order_id] = (max_priority - priority + 1) if span >= 0 else 1
     return weights
 
 
-def _overlap_minutes(a_start: pd.Timestamp, a_end: pd.Timestamp, b_start: pd.Timestamp, b_end: pd.Timestamp) -> float:
+def _order_is_mto(order: pd.Series) -> bool:
+    return str(order.get("order_type", "MTO")).strip().upper() == "MTO"
+
+
+def _overlap_minutes(
+    a_start: pd.Timestamp,
+    a_end: pd.Timestamp,
+    b_start: pd.Timestamp,
+    b_end: pd.Timestamp,
+) -> float:
     latest_start = max(a_start, b_start)
     earliest_end = min(a_end, b_end)
     if earliest_end <= latest_start:
@@ -321,6 +475,7 @@ def _overlap_minutes(a_start: pd.Timestamp, a_end: pd.Timestamp, b_start: pd.Tim
 # Core model builder
 # ---------------------------------------------------------------------
 
+
 def build_cp_sat_model(
     bundle: DataBundle,
     *,
@@ -330,56 +485,61 @@ def build_cp_sat_model(
     freeze_started_operations: bool = True,
     use_actual_downtime: bool = False,
     horizon_padding_minutes: int = 240,
+    missed_otif_penalty: int = 100_000,
+    missed_quantity_penalty: int = 1_000,
     tardiness_weight: int = 100,
     makespan_weight: int = 1,
     preference_bonus: int = 5,
 ) -> Tuple[cp_model.CpModel, Dict[str, object]]:
-    """
-    Build a CP-SAT model for the schedule.
+    """Build a CP-SAT model for the schedule.
 
     Modeling choices:
-    - exactly one assignment per operation
-    - each assignment picks a machine and a shift window
-    - operation must fully fit inside one shift
-    - no overlap on the same machine
-    - precedence within each order
-    - weighted tardiness + makespan + mild preferred-machine reward
-    - downtime added as fixed intervals on the affected machine
-    - in rescheduling mode, completed operations are fixed and optionally
-      already-started operations are also fixed
+    - exactly one assignment per operation;
+    - each assignment chooses a machine and a shift window;
+    - each operation must fully fit inside one shift;
+    - operations cannot overlap on the same machine;
+    - routing precedence is enforced inside each order batch, not across all batches;
+    - batches of the same order can flow through the route in parallel when machines are available;
+    - downtime is modeled as fixed intervals on the affected machine;
+    - MTO OTIF is the primary objective, with partial fill by deadline as a secondary objective.
     """
     origin = _time_origin(bundle)
     model = cp_model.CpModel()
 
     machines = bundle.machines.copy()
-    orders = bundle.orders.copy()
-    operations = bundle.operations.copy().sort_values(["order_id", "sequence_index"]).reset_index(drop=True)
+    orders = _normalize_orders(bundle.orders)
+    operations = _normalize_operations(bundle.operations, orders).sort_values(
+        ["order_id", "batch_index", "sequence_index"]
+    ).reset_index(drop=True)
     shifts = bundle.shifts.copy()
 
     group_to_machines = _machine_group_map(machines)
     shift_map = _shift_lookup(shifts, origin)
     priority_weights = _priority_weight_map(orders)
 
-    # Planning horizon.
-    max_shift_end = shifts.loc[_coerce_bool_series(shifts["is_working"]) if "is_working" in shifts.columns else slice(None), "shift_end"].max()
+    if "is_working" in shifts.columns:
+        working_shift_mask = _coerce_bool_series(shifts["is_working"])
+        max_shift_end = shifts.loc[working_shift_mask, "shift_end"].max()
+    else:
+        max_shift_end = shifts["shift_end"].max()
     if pd.isna(max_shift_end):
         raise ValueError("No working shifts in shifts.csv.")
     horizon = _to_minute(max_shift_end, origin) + horizon_padding_minutes
 
-    # Scenario downtimes.
     downtime_map: Dict[str, List[Tuple[int, int]]] = {}
     if scenario_name != "baseline_no_disruption":
         downtime_map = _downtime_intervals_for_scenario(
-            bundle.downtime_events, scenario_name, origin, use_actual_duration=use_actual_downtime
+            bundle.downtime_events,
+            scenario_name,
+            origin,
+            use_actual_duration=use_actual_downtime,
         )
 
-    # Previous schedule state for rolling rescheduling.
     fixed_assignments: Dict[str, Dict[str, object]] = {}
     if previous_schedule is not None:
         prev = previous_schedule.copy()
         prev["start_time"] = pd.to_datetime(prev["start_time"])
         prev["end_time"] = pd.to_datetime(prev["end_time"])
-
         if replan_time is None:
             raise ValueError("replan_time must be provided when previous_schedule is used.")
 
@@ -401,19 +561,15 @@ def build_cp_sat_model(
             elif start_t < replan_time and freeze_started_operations:
                 start_min = _to_minute(start_t, origin)
                 original_duration = _to_minute(end_t, origin) - start_min
-
                 machine_shifts = shift_map.get(machine_id, [])
                 if not machine_shifts:
                     raise ValueError(f"No working shifts found for machine {machine_id}.")
-
-                blocked_windows = downtime_map.get(machine_id, [])
-                available_windows = _subtract_intervals(machine_shifts, blocked_windows)
+                available_windows = _subtract_intervals(machine_shifts, downtime_map.get(machine_id, []))
                 adjusted_end = _finish_time_in_available_windows(
                     start_min,
                     original_duration,
                     available_windows,
                 )
-
                 fixed_assignments[op_id] = {
                     "machine_id": machine_id,
                     "start": start_min,
@@ -423,7 +579,6 @@ def build_cp_sat_model(
                     "was_in_progress_at_replan": True,
                 }
 
-    # Main variable stores.
     op_start: Dict[str, cp_model.IntVar] = {}
     op_end: Dict[str, cp_model.IntVar] = {}
     op_present: Dict[Tuple[str, str, int, int, int], cp_model.BoolVar] = {}
@@ -431,33 +586,46 @@ def build_cp_sat_model(
     op_choice_start: Dict[Tuple[str, str, int, int, int], cp_model.IntVar] = {}
     op_choice_end: Dict[Tuple[str, str, int, int, int], cp_model.IntVar] = {}
     op_machine_choice_terms: List[cp_model.BoolVar] = []
-    fixed_machine_windows: Dict[str, List[Tuple[int, int]]] = {str(mid): [] for mid in machines["machine_id"].astype(str).tolist()}
-    fixed_interval_by_machine: Dict[str, List[cp_model.IntervalVar]] = {str(mid): [] for mid in machines["machine_id"].astype(str).tolist()}
 
-    # Group operations by order for precedence links.
+    fixed_machine_windows: Dict[str, List[Tuple[int, int]]] = {
+        str(machine_id): [] for machine_id in machines["machine_id"].astype(str).tolist()
+    }
+    fixed_interval_by_machine: Dict[str, List[cp_model.IntervalVar]] = {
+        str(machine_id): [] for machine_id in machines["machine_id"].astype(str).tolist()
+    }
+
     ops_by_order = {
-        order_id: df.sort_values("sequence_index")["operation_id"].tolist()
+        str(order_id): df.sort_values(["batch_index", "sequence_index"])["operation_id"].astype(str).tolist()
         for order_id, df in operations.groupby("order_id")
     }
 
-    # Build assignment options.
+    ops_by_batch = {
+        (str(order_id), str(batch_id)): df.sort_values("sequence_index")["operation_id"].astype(str).tolist()
+        for (order_id, batch_id), df in operations.groupby(["order_id", "batch_id"])
+    }
+
+    batch_quantity_map = {
+        (str(row["order_id"]), str(row["batch_id"])): int(row["batch_quantity"])
+        for _, row in (
+            operations.groupby(["order_id", "batch_id"], as_index=False)["batch_quantity"].max()
+        ).iterrows()
+    }
+
     for _, op in operations.iterrows():
         op_id = str(op["operation_id"])
         order_id = str(op["order_id"])
         required_group = str(op["machine_group_required"])
         preferred_machine = str(op["preferred_machine_id"]) if pd.notna(op.get("preferred_machine_id")) else None
-        proc_minutes = int(op["processing_time_minutes"])
-        setup_minutes = int(op["setup_time_minutes"])
-        duration = proc_minutes + setup_minutes
+        duration = int(op["total_duration_minutes"])
 
-        release_dt = (
-            op["release_time"]
-            if pd.notna(op["release_time"])
-            else orders.loc[orders["order_id"] == order_id, "release_time"].iloc[0]
-        )
+        if duration <= 0:
+            raise ValueError(f"Operation {op_id} has a non-positive duration.")
+
+        release_dt = op["release_time"] if pd.notna(op.get("release_time")) else orders.loc[
+            orders["order_id"].astype(str) == order_id,
+            "release_time",
+        ].iloc[0]
         release_min = _to_minute(release_dt, origin)
-
-        # In replan mode, nothing should start before replan_time unless fixed.
         if replan_time is not None:
             release_min = max(release_min, _to_minute(replan_time, origin))
 
@@ -471,15 +639,17 @@ def build_cp_sat_model(
             fixed_start = int(fix["start"])
             fixed_end = int(fix["end"])
             machine_id = str(fix["machine_id"])
-
             model.Add(start_var == fixed_start)
             model.Add(end_var == fixed_end)
-
             reserved_duration = fixed_end - fixed_start
             if reserved_duration < 0:
                 raise ValueError(f"Negative reserved duration for fixed operation {op_id}.")
-
-            fixed_interval = model.NewIntervalVar(start_var, reserved_duration, end_var, f"fixed_iv_{op_id}")
+            fixed_interval = model.NewIntervalVar(
+                start_var,
+                reserved_duration,
+                end_var,
+                f"fixed_iv_{op_id}",
+            )
             fixed_interval_by_machine.setdefault(machine_id, []).append(fixed_interval)
             fixed_machine_windows.setdefault(machine_id, []).append((fixed_start, fixed_end))
             continue
@@ -500,101 +670,155 @@ def build_cp_sat_model(
                     continue
 
                 choice = model.NewBoolVar(f"present_{op_id}_{machine_id}_s{shift_idx}")
-                s = model.NewIntVar(lb, ub, f"s_{op_id}_{machine_id}_s{shift_idx}")
-                e = model.NewIntVar(lb + duration, ub + duration, f"e_{op_id}_{machine_id}_s{shift_idx}")
-                interval = model.NewOptionalIntervalVar(s, duration, e, choice, f"iv_{op_id}_{machine_id}_s{shift_idx}")
+                start_choice = model.NewIntVar(lb, ub, f"s_{op_id}_{machine_id}_s{shift_idx}")
+                end_choice = model.NewIntVar(
+                    lb + duration,
+                    ub + duration,
+                    f"e_{op_id}_{machine_id}_s{shift_idx}",
+                )
+                interval = model.NewOptionalIntervalVar(
+                    start_choice,
+                    duration,
+                    end_choice,
+                    choice,
+                    f"iv_{op_id}_{machine_id}_s{shift_idx}",
+                )
 
                 key = (op_id, machine_id, shift_idx, lb, ub)
                 op_present[key] = choice
-                op_choice_start[key] = s
-                op_choice_end[key] = e
+                op_choice_start[key] = start_choice
+                op_choice_end[key] = end_choice
                 op_interval[key] = interval
-
-                model.Add(start_var == s).OnlyEnforceIf(choice)
-                model.Add(end_var == e).OnlyEnforceIf(choice)
-
+                model.Add(start_var == start_choice).OnlyEnforceIf(choice)
+                model.Add(end_var == end_choice).OnlyEnforceIf(choice)
                 alternatives.append(choice)
+
                 if preferred_machine and machine_id == preferred_machine:
                     op_machine_choice_terms.append(choice)
 
         if not alternatives:
             raise ValueError(
                 f"No feasible machine/shift assignment options for operation {op_id}. "
-                f"Check shift windows, release times, and durations."
+                f"Check shift windows, release times, downtime, and duration={duration}."
             )
         model.AddExactlyOne(alternatives)
 
-    # Precedence constraints inside each order.
-    for order_id, op_ids in ops_by_order.items():
+    for (order_id, batch_id), op_ids in ops_by_batch.items():
         for prev_op, next_op in zip(op_ids, op_ids[1:]):
             model.Add(op_start[next_op] >= op_end[prev_op])
 
-    # No-overlap by machine, plus downtime blocks.
     effective_downtime_map: Dict[str, List[Tuple[int, int]]] = {}
     for machine_id in machines["machine_id"].astype(str).tolist():
         intervals: List[cp_model.IntervalVar] = []
-
         for key, interval in op_interval.items():
             _, mid, _, _, _ = key
             if mid == machine_id:
                 intervals.append(interval)
 
-        if machine_id in fixed_interval_by_machine:
-            intervals.extend(fixed_interval_by_machine[machine_id])
+        intervals.extend(fixed_interval_by_machine.get(machine_id, []))
 
         effective_machine_downtime = _subtract_intervals(
             downtime_map.get(machine_id, []),
             fixed_machine_windows.get(machine_id, []),
         )
         effective_downtime_map[machine_id] = effective_machine_downtime
-
-        for d_idx, (ds, de) in enumerate(effective_machine_downtime):
-            duration = int(de - ds)
+        for downtime_idx, (downtime_start, downtime_end) in enumerate(effective_machine_downtime):
+            duration = int(downtime_end - downtime_start)
             if duration <= 0:
                 continue
-            intervals.append(model.NewIntervalVar(ds, duration, de, f"downtime_{machine_id}_{d_idx}"))
+            intervals.append(
+                model.NewIntervalVar(
+                    downtime_start,
+                    duration,
+                    downtime_end,
+                    f"downtime_{machine_id}_{downtime_idx}",
+                )
+            )
 
         if intervals:
             model.AddNoOverlap(intervals)
 
-    # Order completion and tardiness.
     completion_vars: Dict[str, cp_model.IntVar] = {}
     tardiness_vars: Dict[str, cp_model.IntVar] = {}
+    otif_vars: Dict[str, cp_model.BoolVar] = {}
+    batch_completion_vars: Dict[Tuple[str, str], cp_model.IntVar] = {}
+    batch_on_time_vars: Dict[Tuple[str, str], cp_model.BoolVar] = {}
 
     for _, order in orders.iterrows():
         order_id = str(order["order_id"])
         op_ids = ops_by_order.get(order_id, [])
         if not op_ids:
             continue
+
         completion = model.NewIntVar(0, horizon, f"completion_{order_id}")
         model.AddMaxEquality(completion, [op_end[op_id] for op_id in op_ids])
         completion_vars[order_id] = completion
 
-        deadline = order["deadline"]
+        deadline = order.get("promised_date", order.get("deadline"))
         deadline_min = _to_minute(deadline, origin)
+
         tardiness = model.NewIntVar(0, horizon, f"tardiness_{order_id}")
         model.Add(tardiness >= completion - deadline_min)
         model.Add(tardiness >= 0)
         tardiness_vars[order_id] = tardiness
 
-    # Makespan.
+        # Order-level OTIF: all batches must be complete by the promised date.
+        otif = model.NewBoolVar(f"otif_{order_id}")
+        model.Add(completion <= deadline_min).OnlyEnforceIf(otif)
+        model.Add(completion >= deadline_min + 1).OnlyEnforceIf(otif.Not())
+        otif_vars[order_id] = otif
+
+        # Batch-level completion flags support partial-fill metrics and objective terms.
+        for (batch_order_id, batch_id), batch_op_ids in ops_by_batch.items():
+            if batch_order_id != order_id:
+                continue
+            batch_completion = model.NewIntVar(0, horizon, f"completion_{batch_id}")
+            model.AddMaxEquality(batch_completion, [op_end[op_id] for op_id in batch_op_ids])
+            batch_completion_vars[(order_id, batch_id)] = batch_completion
+
+            batch_on_time = model.NewBoolVar(f"batch_on_time_{batch_id}")
+            model.Add(batch_completion <= deadline_min).OnlyEnforceIf(batch_on_time)
+            model.Add(batch_completion >= deadline_min + 1).OnlyEnforceIf(batch_on_time.Not())
+            batch_on_time_vars[(order_id, batch_id)] = batch_on_time
+
     makespan = model.NewIntVar(0, horizon, "makespan")
     if completion_vars:
         model.AddMaxEquality(makespan, list(completion_vars.values()))
     else:
         model.Add(makespan == 0)
 
-    # Objective: minimize weighted tardiness + makespan - mild reward for preferred machines.
+    missed_otif_terms = []
+    missed_quantity_terms = []
     tardiness_terms = []
     for _, order in orders.iterrows():
         order_id = str(order["order_id"])
         urgency_weight = int(priority_weights.get(order_id, 1))
+
+        if order_id in otif_vars and _order_is_mto(order):
+            missed_otif_terms.append(urgency_weight * (1 - otif_vars[order_id]))
+
+            order_quantity = int(order.get("order_quantity", 1))
+            completed_by_deadline_terms = []
+            for (batch_order_id, batch_id), batch_on_time in batch_on_time_vars.items():
+                if batch_order_id == order_id:
+                    completed_by_deadline_terms.append(
+                        int(batch_quantity_map.get((batch_order_id, batch_id), 0)) * batch_on_time
+                    )
+            # Secondary objective: even when an order cannot be fully OTIF, prefer
+            # schedules that complete more of its quantity by the promised date.
+            missed_quantity_terms.append(
+                urgency_weight * (order_quantity - sum(completed_by_deadline_terms))
+            )
+
         if order_id in tardiness_vars:
             tardiness_terms.append(urgency_weight * tardiness_vars[order_id])
 
     preferred_reward = sum(op_machine_choice_terms) if op_machine_choice_terms else 0
+
     model.Minimize(
-        tardiness_weight * sum(tardiness_terms)
+        missed_otif_penalty * sum(missed_otif_terms)
+        + missed_quantity_penalty * sum(missed_quantity_terms)
+        + tardiness_weight * sum(tardiness_terms)
         + makespan_weight * makespan
         - preference_bonus * preferred_reward
     )
@@ -612,11 +836,22 @@ def build_cp_sat_model(
         "op_choice_end": op_choice_end,
         "completion_vars": completion_vars,
         "tardiness_vars": tardiness_vars,
+        "otif_vars": otif_vars,
+        "batch_completion_vars": batch_completion_vars,
+        "batch_on_time_vars": batch_on_time_vars,
+        "batch_quantity_map": batch_quantity_map,
         "makespan": makespan,
         "downtime_map": effective_downtime_map,
         "raw_downtime_map": downtime_map,
         "fixed_assignments": fixed_assignments,
         "priority_weights": priority_weights,
+        "objective_weights": {
+            "missed_otif_penalty": missed_otif_penalty,
+            "missed_quantity_penalty": missed_quantity_penalty,
+            "tardiness_weight": tardiness_weight,
+            "makespan_weight": makespan_weight,
+            "preference_bonus": preference_bonus,
+        },
     }
     return model, context
 
@@ -624,6 +859,7 @@ def build_cp_sat_model(
 # ---------------------------------------------------------------------
 # Solve and extract schedule
 # ---------------------------------------------------------------------
+
 
 def _solver_status_name(status_code: int) -> str:
     mapping = {
@@ -648,10 +884,9 @@ def _extract_schedule(
     fixed_assignments = context.get("fixed_assignments", {})
 
     rows = []
-
     chosen_machine: Dict[str, str] = {}
     for key, present_var in op_present.items():
-        op_id, machine_id, shift_idx, _, _ = key
+        op_id, machine_id, _, _, _ = key
         if solver.Value(present_var) == 1:
             chosen_machine[op_id] = machine_id
 
@@ -666,51 +901,129 @@ def _extract_schedule(
         fixed_info = fixed_assignments.get(op_id, {})
         was_in_progress = bool(fixed_info.get("was_in_progress_at_replan", False))
 
-        rows.append({
-            "operation_id": op_id,
-            "order_id": str(op["order_id"]),
-            "sequence_index": int(op["sequence_index"]),
-            "machine_group_required": str(op["machine_group_required"]),
-            "machine_id": chosen_machine.get(op_id, None),
-            "start_minute": start_min,
-            "end_minute": end_min,
-            "start_time": _from_minute(start_min, origin),
-            "end_time": _from_minute(end_min, origin),
-            "processing_time_minutes": int(op["processing_time_minutes"]),
-            "setup_time_minutes": int(op["setup_time_minutes"]),
-            "scheduled_duration_minutes": int(end_min - start_min),
-            "active_work_minutes": int(op["processing_time_minutes"]) + int(op["setup_time_minutes"]),
-            "was_in_progress_at_replan": was_in_progress,
-        })
+        rows.append(
+            {
+                "operation_id": op_id,
+                "order_id": str(op["order_id"]),
+                "batch_id": str(op.get("batch_id", f"{op['order_id']}_B001")),
+                "batch_index": int(op.get("batch_index", 1)),
+                "batch_quantity": int(op.get("batch_quantity", op.get("operation_quantity", 1))),
+                "sequence_index": int(op["sequence_index"]),
+                "machine_group_required": str(op["machine_group_required"]),
+                "machine_id": chosen_machine.get(op_id),
+                "operation_quantity": int(op.get("operation_quantity", 1)),
+                "unit_processing_time_minutes": int(op.get("unit_processing_time_minutes", 0)),
+                "processing_time_minutes": int(op.get("processing_time_minutes", 0)),
+                "setup_time_minutes": int(op.get("setup_time_minutes", 0)),
+                "total_duration_minutes": int(op.get("total_duration_minutes", end_min - start_min)),
+                "start_minute": int(start_min),
+                "end_minute": int(end_min),
+                "start_time": _from_minute(start_min, origin),
+                "end_time": _from_minute(end_min, origin),
+                "scheduled_duration_minutes": int(end_min - start_min),
+                "active_work_minutes": int(op.get("total_duration_minutes", end_min - start_min)),
+                "was_in_progress_at_replan": was_in_progress,
+            }
+        )
 
     schedule = pd.DataFrame(rows).sort_values(
-        ["start_minute", "machine_id", "order_id", "sequence_index"]
+        ["start_minute", "machine_id", "order_id", "batch_index", "sequence_index"]
     ).reset_index(drop=True)
     return schedule
 
 
 def _build_order_summary(schedule: pd.DataFrame, orders: pd.DataFrame) -> pd.DataFrame:
-    if schedule.empty:
-        return pd.DataFrame(columns=[
-            "order_id", "completion_time", "deadline", "priority",
-            "tardiness_minutes", "is_late", "priority_weight"
-        ])
-
+    """Build order-level OTIF/fill summary from a possibly batch-split schedule."""
+    orders = _normalize_orders(orders)
     priority_weights = _priority_weight_map(orders)
-    completion = (
-        schedule.groupby("order_id", as_index=False)["end_time"]
-        .max()
-        .rename(columns={"end_time": "completion_time"})
+
+    base = orders.copy()
+    base["priority_weight"] = base["order_id"].astype(str).map(priority_weights).fillna(1).astype(int)
+    base["deadline"] = pd.to_datetime(base["deadline"])
+    base["promised_date"] = pd.to_datetime(base.get("promised_date", base["deadline"]))
+    base["order_quantity"] = pd.to_numeric(base["order_quantity"], errors="coerce").fillna(1).clip(lower=1).astype(int)
+
+    if schedule.empty:
+        base["completion_time"] = pd.NaT
+        base["completed_quantity_total"] = 0
+        base["completed_quantity_by_deadline"] = 0
+        base["fill_rate_by_deadline"] = 0.0
+        base["num_batches"] = 0
+        base["tardiness_minutes"] = math.nan
+        base["on_time"] = False
+        base["in_full"] = False
+        base["otif"] = False
+        base["is_late"] = True
+        return base.reset_index(drop=True)
+
+    sched = schedule.copy()
+    sched["order_id"] = sched["order_id"].astype(str)
+    if "batch_id" not in sched.columns:
+        sched["batch_id"] = sched["order_id"] + "_B001"
+    sched["batch_id"] = sched["batch_id"].astype(str)
+
+    if "batch_quantity" not in sched.columns:
+        if "operation_quantity" in sched.columns:
+            sched["batch_quantity"] = sched["operation_quantity"]
+        else:
+            sched["batch_quantity"] = 1
+    sched["batch_quantity"] = pd.to_numeric(sched["batch_quantity"], errors="coerce").fillna(1).clip(lower=1).astype(int)
+    sched["end_time"] = pd.to_datetime(sched["end_time"])
+
+    batch_completion = (
+        sched.groupby(["order_id", "batch_id"], as_index=False)
+        .agg(
+            batch_completion_time=("end_time", "max"),
+            batch_quantity=("batch_quantity", "max"),
+        )
     )
-    out = orders.merge(completion, on="order_id", how="left")
-    out["priority_weight"] = out["order_id"].astype(str).map(priority_weights).fillna(1).astype(int)
+    batch_completion = batch_completion.merge(
+        base[["order_id", "promised_date"]],
+        on="order_id",
+        how="left",
+    )
+    batch_completion["completed_by_deadline"] = (
+        batch_completion["batch_completion_time"] <= batch_completion["promised_date"]
+    )
+    batch_completion["quantity_by_deadline"] = (
+        batch_completion["batch_quantity"] * batch_completion["completed_by_deadline"].astype(int)
+    )
+
+    completion = (
+        batch_completion.groupby("order_id", as_index=False)
+        .agg(
+            completion_time=("batch_completion_time", "max"),
+            completed_quantity_total=("batch_quantity", "sum"),
+            completed_quantity_by_deadline=("quantity_by_deadline", "sum"),
+            num_batches=("batch_id", "nunique"),
+        )
+    )
+
+    # Drop any generator-provided num_batches before merging, because the schedule-derived
+    # value is the source of truth for the solved plan.
+    out = base.drop(columns=["num_batches"], errors="ignore").merge(completion, on="order_id", how="left")
+    out["completion_time"] = pd.to_datetime(out["completion_time"])
+    for column in ["completed_quantity_total", "completed_quantity_by_deadline", "num_batches"]:
+        out[column] = pd.to_numeric(out[column], errors="coerce").fillna(0).astype(int)
+
+    out["fill_rate_by_deadline"] = (
+        out["completed_quantity_by_deadline"] / out["order_quantity"].replace(0, pd.NA)
+    ).fillna(0.0).clip(lower=0.0, upper=1.0)
+
     out["tardiness_minutes"] = (
-        (pd.to_datetime(out["completion_time"]) - pd.to_datetime(out["deadline"])).dt.total_seconds() / 60.0
+        (out["completion_time"] - out["promised_date"]).dt.total_seconds() / 60.0
     ).fillna(0).clip(lower=0)
-    out["is_late"] = out["tardiness_minutes"] > 0
+
+    # With one promised date per order, "on time" means the last batch is complete
+    # by that date; "in full" means the ordered quantity is complete by that date.
+    out["on_time"] = out["completion_time"].notna() & (out["completion_time"] <= out["promised_date"])
+    out["in_full"] = out["completed_quantity_by_deadline"] >= out["order_quantity"]
+    out["otif"] = out["on_time"] & out["in_full"]
+    out["is_late"] = ~out["on_time"]
+
     return out.sort_values(
-        ["is_late", "tardiness_minutes", "priority_weight"],
-        ascending=[False, False, False]
+        ["otif", "fill_rate_by_deadline", "tardiness_minutes", "priority_weight"],
+        ascending=[True, True, False, False],
     ).reset_index(drop=True)
 
 
@@ -722,21 +1035,23 @@ def solve_schedule(
     num_search_workers: int = 8,
     use_actual_downtime: bool = False,
     log_search_progress: bool = False,
+    missed_otif_penalty: int = 100_000,
+    missed_quantity_penalty: int = 1_000,
+    tardiness_weight: int = 100,
+    makespan_weight: int = 1,
+    preference_bonus: int = 5,
 ) -> SolveResult:
-    """
-    Solve the full scheduling problem for a scenario.
-
-    For baseline runs, use scenario_name='baseline_no_disruption'.
-    For disruption runs, use a scenario from scenarios.csv, for example:
-    - optimistic_estimate
-    - pessimistic_estimate
-    - updated_after_10_min
-    """
+    """Solve the full scheduling problem for one scenario."""
     bundle = load_data_bundle(bundle_dir)
     model, context = build_cp_sat_model(
         bundle,
         scenario_name=scenario_name,
         use_actual_downtime=use_actual_downtime,
+        missed_otif_penalty=missed_otif_penalty,
+        missed_quantity_penalty=missed_quantity_penalty,
+        tardiness_weight=tardiness_weight,
+        makespan_weight=makespan_weight,
+        preference_bonus=preference_bonus,
     )
 
     solver = cp_model.CpSolver()
@@ -746,25 +1061,28 @@ def solve_schedule(
 
     t0 = time.perf_counter()
     status = solver.Solve(model)
-    dt = time.perf_counter() - t0
+    elapsed = time.perf_counter() - t0
     status_name = _solver_status_name(status)
 
     if status_name not in {"OPTIMAL", "FEASIBLE"}:
         return SolveResult(
             status=status_name,
             objective_value=None,
-            solve_time_seconds=dt,
+            solve_time_seconds=elapsed,
             schedule=pd.DataFrame(),
-            order_summary=pd.DataFrame(),
-            metadata={"scenario_name": scenario_name},
+            order_summary=_build_order_summary(pd.DataFrame(), context["orders"]),
+            metadata={
+                "scenario_name": scenario_name,
+                "status_note": "No feasible schedule was found within the solver limits.",
+            },
         )
 
     schedule = _extract_schedule(solver, context)
-    order_summary = _build_order_summary(schedule, bundle.orders)
+    order_summary = _build_order_summary(schedule, context["orders"])
     return SolveResult(
         status=status_name,
         objective_value=solver.ObjectiveValue(),
-        solve_time_seconds=dt,
+        solve_time_seconds=elapsed,
         schedule=schedule,
         order_summary=order_summary,
         metadata={
@@ -772,6 +1090,7 @@ def solve_schedule(
             "origin": context["origin"],
             "horizon": context["horizon"],
             "priority_weights": context["priority_weights"],
+            "objective_weights": context["objective_weights"],
         },
     )
 
@@ -779,6 +1098,7 @@ def solve_schedule(
 # ---------------------------------------------------------------------
 # Rolling rescheduling
 # ---------------------------------------------------------------------
+
 
 def run_reschedule_on_event(
     bundle_dir: str | Path,
@@ -791,27 +1111,13 @@ def run_reschedule_on_event(
     time_limit_seconds: float = 20.0,
     num_search_workers: int = 8,
     log_search_progress: bool = False,
+    missed_otif_penalty: int = 100_000,
+    missed_quantity_penalty: int = 1_000,
+    tardiness_weight: int = 100,
+    makespan_weight: int = 1,
+    preference_bonus: int = 5,
 ) -> SolveResult:
-    """
-    Replan from an existing baseline schedule after a disruption event.
-
-    Parameters
-    ----------
-    baseline_schedule_df:
-        A DataFrame returned by solve_schedule(...).schedule
-    scenario_name:
-        One of the names from scenarios.csv
-    replan_time:
-        If omitted, the scenario event_start is used.
-    freeze_started_operations:
-        If True, operations that already started before replan_time stay fixed.
-        This matches the common non-preemptive manufacturing assumption.
-        If a frozen operation is interrupted by downtime, its reserved end time is
-        automatically extended to account for the lost availability.
-    use_actual_downtime:
-        If True, use actual_duration_minutes.
-        If False, use estimated_duration_minutes.
-    """
+    """Replan from an existing baseline schedule after a disruption event."""
     bundle = load_data_bundle(bundle_dir)
     scenario = _scenario_row(bundle.scenarios, scenario_name)
 
@@ -829,6 +1135,11 @@ def run_reschedule_on_event(
         previous_schedule=baseline_schedule_df,
         freeze_started_operations=freeze_started_operations,
         use_actual_downtime=use_actual_downtime,
+        missed_otif_penalty=missed_otif_penalty,
+        missed_quantity_penalty=missed_quantity_penalty,
+        tardiness_weight=tardiness_weight,
+        makespan_weight=makespan_weight,
+        preference_bonus=preference_bonus,
     )
 
     solver = cp_model.CpSolver()
@@ -841,45 +1152,43 @@ def run_reschedule_on_event(
     prev["end_time"] = pd.to_datetime(prev["end_time"])
     origin = context["origin"]
     fixed = set(context["fixed_assignments"].keys())
-
     op_start = context["op_start"]
     op_end = context["op_end"]
+
     for _, row in prev.iterrows():
         op_id = str(row["operation_id"])
         if op_id in fixed:
             continue
-        if row["start_time"] >= replan_ts:
-            if op_id in op_start and op_id in op_end:
-                solver_hint_start = _to_minute(row["start_time"], origin)
-                solver_hint_end = _to_minute(row["end_time"], origin)
-                model.AddHint(op_start[op_id], solver_hint_start)
-                model.AddHint(op_end[op_id], solver_hint_end)
+        if row["start_time"] >= replan_ts and op_id in op_start and op_id in op_end:
+            model.AddHint(op_start[op_id], _to_minute(row["start_time"], origin))
+            model.AddHint(op_end[op_id], _to_minute(row["end_time"], origin))
 
     t0 = time.perf_counter()
     status = solver.Solve(model)
-    dt = time.perf_counter() - t0
+    elapsed = time.perf_counter() - t0
     status_name = _solver_status_name(status)
 
     if status_name not in {"OPTIMAL", "FEASIBLE"}:
         return SolveResult(
             status=status_name,
             objective_value=None,
-            solve_time_seconds=dt,
+            solve_time_seconds=elapsed,
             schedule=pd.DataFrame(),
-            order_summary=pd.DataFrame(),
+            order_summary=_build_order_summary(pd.DataFrame(), context["orders"]),
             metadata={
                 "scenario_name": scenario_name,
                 "replan_time": replan_ts,
                 "use_actual_downtime": use_actual_downtime,
+                "status_note": "No feasible reschedule was found within the solver limits.",
             },
         )
 
     schedule = _extract_schedule(solver, context)
-    order_summary = _build_order_summary(schedule, bundle.orders)
+    order_summary = _build_order_summary(schedule, context["orders"])
     return SolveResult(
         status=status_name,
         objective_value=solver.ObjectiveValue(),
-        solve_time_seconds=dt,
+        solve_time_seconds=elapsed,
         schedule=schedule,
         order_summary=order_summary,
         metadata={
@@ -889,6 +1198,7 @@ def run_reschedule_on_event(
             "origin": context["origin"],
             "horizon": context["horizon"],
             "priority_weights": context["priority_weights"],
+            "objective_weights": context["objective_weights"],
         },
     )
 
@@ -896,6 +1206,7 @@ def run_reschedule_on_event(
 # ---------------------------------------------------------------------
 # KPI layer
 # ---------------------------------------------------------------------
+
 
 def compute_kpis(
     schedule_df: pd.DataFrame,
@@ -905,27 +1216,43 @@ def compute_kpis(
     *,
     previous_schedule_df: Optional[pd.DataFrame] = None,
 ) -> Dict[str, float]:
-    """
-    Compute the most useful business and operational KPIs for the demo.
-    """
+    """Compute business and operational KPIs for the demo."""
+    empty_result = {
+        "num_scheduled_operations": 0.0,
+        "num_orders": 0.0,
+        "num_mto_orders": 0.0,
+        "otif_orders": math.nan,
+        "otif_rate": math.nan,
+        "mto_otif_orders": math.nan,
+        "mto_otif_rate": math.nan,
+        "weighted_otif_rate": math.nan,
+        "missed_otif_orders": math.nan,
+        "missed_mto_otif_orders": math.nan,
+        "late_orders": math.nan,
+        "late_mto_orders": math.nan,
+        "total_order_quantity": math.nan,
+        "completed_quantity_by_deadline": math.nan,
+        "average_fill_rate_by_deadline": math.nan,
+        "mto_average_fill_rate_by_deadline": math.nan,
+        "makespan_minutes": math.nan,
+        "total_tardiness_minutes": math.nan,
+        "priority_weighted_tardiness": math.nan,
+        "machine_idle_minutes_inside_used_windows": math.nan,
+        "average_operation_shift_minutes_vs_previous": math.nan,
+        "changed_operations_vs_previous": math.nan,
+    }
     if schedule_df.empty:
-        return {
-            "num_scheduled_operations": 0,
-            "num_orders": 0,
-            "makespan_minutes": math.nan,
-            "total_tardiness_minutes": math.nan,
-            "late_orders": math.nan,
-            "priority_weighted_tardiness": math.nan,
-            "machine_idle_minutes_inside_used_windows": math.nan,
-            "average_operation_shift_minutes_vs_previous": math.nan,
-            "changed_operations_vs_previous": math.nan,
-        }
+        return empty_result
 
     schedule = schedule_df.copy()
     schedule["start_time"] = pd.to_datetime(schedule["start_time"])
     schedule["end_time"] = pd.to_datetime(schedule["end_time"])
     if "active_work_minutes" not in schedule.columns:
-        if {"processing_time_minutes", "setup_time_minutes"}.issubset(schedule.columns):
+        if "total_duration_minutes" in schedule.columns:
+            schedule["active_work_minutes"] = pd.to_numeric(
+                schedule["total_duration_minutes"], errors="coerce"
+            ).fillna(0)
+        elif {"processing_time_minutes", "setup_time_minutes"}.issubset(schedule.columns):
             schedule["active_work_minutes"] = (
                 pd.to_numeric(schedule["processing_time_minutes"], errors="coerce").fillna(0)
                 + pd.to_numeric(schedule["setup_time_minutes"], errors="coerce").fillna(0)
@@ -935,9 +1262,10 @@ def compute_kpis(
                 (schedule["end_time"] - schedule["start_time"]).dt.total_seconds() / 60.0
             )
 
-    orders = orders_df.copy()
-    orders["deadline"] = pd.to_datetime(orders["deadline"])
-    priority_weights = _priority_weight_map(orders)
+    orders = _normalize_orders(orders_df)
+    merged = _build_order_summary(schedule, orders)
+    merged["is_mto"] = merged["order_type"].astype(str).str.upper().eq("MTO")
+    merged["priority_weighted_tardiness"] = merged["priority_weight"] * merged["tardiness_minutes"]
 
     shifts = shifts_df.copy()
     shifts["shift_start"] = pd.to_datetime(shifts["shift_start"])
@@ -949,18 +1277,29 @@ def compute_kpis(
         (schedule["end_time"].max() - schedule["start_time"].min()).total_seconds() / 60.0
     )
 
-    completion = (
-        schedule.groupby("order_id", as_index=False)["end_time"]
-        .max()
-        .rename(columns={"end_time": "completion_time"})
+    total_orders = len(merged)
+    total_mto_orders = int(merged["is_mto"].sum())
+    otif_orders = int(merged["otif"].sum())
+    mto_otif_orders = int((merged["otif"] & merged["is_mto"]).sum())
+    mto_weight_sum = float(merged.loc[merged["is_mto"], "priority_weight"].sum())
+    weighted_otif_sum = float(
+        (merged.loc[merged["is_mto"], "priority_weight"] * merged.loc[merged["is_mto"], "otif"].astype(int)).sum()
     )
-    merged = orders.merge(completion, on="order_id", how="left")
-    merged["priority_weight"] = merged["order_id"].astype(str).map(priority_weights).fillna(1).astype(int)
-    merged["tardiness_minutes"] = (
-        (merged["completion_time"] - merged["deadline"]).dt.total_seconds() / 60.0
-    ).fillna(0).clip(lower=0)
-    merged["is_late"] = merged["tardiness_minutes"] > 0
-    merged["priority_weighted_tardiness"] = merged["priority_weight"] * merged["tardiness_minutes"]
+
+    total_order_quantity = float(pd.to_numeric(merged["order_quantity"], errors="coerce").fillna(0).sum())
+    completed_quantity_by_deadline = float(
+        pd.to_numeric(merged["completed_quantity_by_deadline"], errors="coerce").fillna(0).sum()
+    )
+    average_fill_rate = (
+        float(pd.to_numeric(merged["fill_rate_by_deadline"], errors="coerce").fillna(0).mean())
+        if total_orders
+        else math.nan
+    )
+    mto_average_fill_rate = (
+        float(pd.to_numeric(merged.loc[merged["is_mto"], "fill_rate_by_deadline"], errors="coerce").fillna(0).mean())
+        if total_mto_orders
+        else math.nan
+    )
 
     idle_total = 0.0
     for machine_id, dfm in schedule.groupby("machine_id"):
@@ -970,10 +1309,8 @@ def compute_kpis(
         dfm = dfm.sort_values("start_time")
         if dfm.empty:
             continue
-
         first_start = dfm["start_time"].min()
         last_end = dfm["end_time"].max()
-
         working_minutes = 0.0
         for _, shift_row in shifts[shifts["machine_id"].astype(str) == machine_id].iterrows():
             working_minutes += _overlap_minutes(
@@ -982,7 +1319,6 @@ def compute_kpis(
                 pd.to_datetime(shift_row["shift_start"]),
                 pd.to_datetime(shift_row["shift_end"]),
             )
-
         busy_minutes = float(pd.to_numeric(dfm["active_work_minutes"], errors="coerce").fillna(0).sum())
         idle_total += max(0.0, working_minutes - busy_minutes)
 
@@ -991,12 +1327,15 @@ def compute_kpis(
     if previous_schedule_df is not None and not previous_schedule_df.empty:
         prev = previous_schedule_df.copy()
         prev["start_time"] = pd.to_datetime(prev["start_time"])
+        prev["end_time"] = pd.to_datetime(prev["end_time"])
         compare = schedule.merge(
-            prev[["operation_id", "machine_id", "start_time", "end_time"]].rename(columns={
-                "machine_id": "prev_machine_id",
-                "start_time": "prev_start_time",
-                "end_time": "prev_end_time",
-            }),
+            prev[["operation_id", "machine_id", "start_time", "end_time"]].rename(
+                columns={
+                    "machine_id": "prev_machine_id",
+                    "start_time": "prev_start_time",
+                    "end_time": "prev_end_time",
+                }
+            ),
             on="operation_id",
             how="inner",
         )
@@ -1011,10 +1350,23 @@ def compute_kpis(
 
     return {
         "num_scheduled_operations": float(len(schedule)),
-        "num_orders": float(schedule["order_id"].nunique()),
+        "num_orders": float(total_orders),
+        "num_mto_orders": float(total_mto_orders),
+        "otif_orders": float(otif_orders),
+        "otif_rate": float(otif_orders / total_orders) if total_orders else math.nan,
+        "mto_otif_orders": float(mto_otif_orders),
+        "mto_otif_rate": float(mto_otif_orders / total_mto_orders) if total_mto_orders else math.nan,
+        "weighted_otif_rate": float(weighted_otif_sum / mto_weight_sum) if mto_weight_sum else math.nan,
+        "missed_otif_orders": float(total_orders - otif_orders),
+        "missed_mto_otif_orders": float(total_mto_orders - mto_otif_orders),
+        "late_orders": float(merged["is_late"].sum()),
+        "late_mto_orders": float((merged["is_late"] & merged["is_mto"]).sum()),
+        "total_order_quantity": total_order_quantity,
+        "completed_quantity_by_deadline": completed_quantity_by_deadline,
+        "average_fill_rate_by_deadline": average_fill_rate,
+        "mto_average_fill_rate_by_deadline": mto_average_fill_rate,
         "makespan_minutes": float(makespan_minutes),
         "total_tardiness_minutes": float(merged["tardiness_minutes"].sum()),
-        "late_orders": float(merged["is_late"].sum()),
         "priority_weighted_tardiness": float(merged["priority_weighted_tardiness"].sum()),
         "machine_idle_minutes_inside_used_windows": float(idle_total),
         "average_operation_shift_minutes_vs_previous": float(avg_shift) if not math.isnan(avg_shift) else math.nan,
@@ -1030,9 +1382,7 @@ def validate_schedule(
     use_actual_downtime: bool = False,
     replan_time: Optional[str | pd.Timestamp] = None,
 ) -> Dict[str, float]:
-    """
-    Lightweight diagnostic checks for a produced schedule.
-    """
+    """Lightweight diagnostic checks for a produced schedule."""
     if schedule_df.empty:
         return {
             "missing_machine_id": 0.0,
@@ -1066,10 +1416,12 @@ def validate_schedule(
             prev_end = max(prev_end, row["end_time"]) if prev_end is not None else row["end_time"]
 
     precedence_violations = 0
-    for order_id, dfo in schedule.sort_values(["sequence_index", "start_time"]).groupby("order_id"):
-        dfo = dfo.sort_values("sequence_index")
+    if "batch_id" not in schedule.columns:
+        schedule["batch_id"] = schedule["order_id"].astype(str) + "_B001"
+    for _, dfb in schedule.sort_values(["sequence_index", "start_time"]).groupby(["order_id", "batch_id"]):
+        dfb = dfb.sort_values("sequence_index")
         prev_end = None
-        for _, row in dfo.iterrows():
+        for _, row in dfb.iterrows():
             if prev_end is not None and row["start_time"] < prev_end:
                 precedence_violations += 1
             prev_end = row["end_time"]
@@ -1096,13 +1448,14 @@ def validate_schedule(
             use_actual_duration=use_actual_downtime,
         )
         replan_ts = pd.to_datetime(replan_time) if replan_time is not None else None
+
         for _, row in schedule.iterrows():
             machine_id = str(row["machine_id"])
             row_start = _to_minute(pd.to_datetime(row["start_time"]), origin)
             row_end = _to_minute(pd.to_datetime(row["end_time"]), origin)
             started_before_replan = replan_ts is not None and pd.to_datetime(row["start_time"]) < replan_ts
-            for ds, de in downtime_map.get(machine_id, []):
-                overlaps = max(0, min(row_end, de) - max(row_start, ds))
+            for downtime_start, downtime_end in downtime_map.get(machine_id, []):
+                overlaps = max(0, min(row_end, downtime_end) - max(row_start, downtime_start))
                 if overlaps > 0 and not started_before_replan:
                     downtime_overlap_violations += 1
                     break
@@ -1126,17 +1479,17 @@ def export_schedule_csv(schedule_df: pd.DataFrame, output_path: str | Path) -> N
 # Minimal example runner
 # ---------------------------------------------------------------------
 
-if __name__ == "__main__":
-    base = Path("/mnt/data/generated_factory_demo_data/synthetic_demo")
 
-    print("Solving baseline schedule...")
+if __name__ == "__main__":
+    base = Path("generated_factory_demo_data/synthetic_demo")
+    print("Solving baseline MTO/JIT schedule with OTIF objective...")
     baseline = solve_schedule(base, scenario_name="baseline_no_disruption", time_limit_seconds=15)
     print("Baseline status:", baseline.status)
     print("Baseline objective:", baseline.objective_value)
     print("Baseline solve time:", round(baseline.solve_time_seconds, 3), "s")
-    print(baseline.schedule.head().to_string(index=False))
+    print(baseline.order_summary.head().to_string(index=False))
 
-    print("\nRescheduling after optimistic estimate downtime...")
+    print("\nRescheduling after optimistic downtime estimate...")
     repaired = run_reschedule_on_event(
         base,
         baseline.schedule,
@@ -1148,14 +1501,14 @@ if __name__ == "__main__":
     print("Repair status:", repaired.status)
     print("Repair objective:", repaired.objective_value)
     print("Repair solve time:", round(repaired.solve_time_seconds, 3), "s")
-    print(repaired.schedule.head().to_string(index=False))
 
     bundle = load_data_bundle(base)
-    baseline_kpis = compute_kpis(
-        baseline.schedule, bundle.orders, bundle.operations, bundle.shifts
-    )
+    baseline_kpis = compute_kpis(baseline.schedule, bundle.orders, bundle.operations, bundle.shifts)
     repaired_kpis = compute_kpis(
-        repaired.schedule, bundle.orders, bundle.operations, bundle.shifts,
+        repaired.schedule,
+        bundle.orders,
+        bundle.operations,
+        bundle.shifts,
         previous_schedule_df=baseline.schedule,
     )
     print("\nBaseline KPIs:", baseline_kpis)
