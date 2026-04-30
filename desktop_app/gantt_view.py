@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional
+from typing import Dict, Optional
 
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -17,18 +17,20 @@ class GanttView(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.figure = Figure(figsize=(13, 6.5), dpi=120, constrained_layout=True)
+        self.figure = Figure(figsize=(12.0, 4.8), dpi=110)
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.toolbar = NavigationToolbar(self.canvas, self)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        layout.setSpacing(2)
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas, stretch=1)
 
-        self.setMinimumHeight(620)
+        # Do not force a huge widget height: the chart must fit inside
+        # the tab area on laptops and projectors.
+        self.setMinimumHeight(420)
         self.plot_empty("No schedule yet")
 
     def plot_empty(self, message: str) -> None:
@@ -47,6 +49,7 @@ class GanttView(QWidget):
         scenario_name: Optional[str] = None,
         replan_time=None,
         previous_schedule_df: Optional[pd.DataFrame] = None,
+        color_map: Optional[Dict[str, str]] = None,
     ) -> None:
         if schedule_df is None or schedule_df.empty:
             self.plot_empty("No feasible schedule to show")
@@ -62,17 +65,15 @@ class GanttView(QWidget):
         changed_ops = self._find_changed_operations(schedule, previous_schedule_df)
 
         self.figure.clear()
-        chart_height = max(6.5, 1.0 * max(1, len(machines)) + 1.4)
-        self.figure.set_size_inches(14, chart_height, forward=True)
+        self.figure.set_size_inches(12.0, 4.8, forward=True)
         ax = self.figure.add_subplot(111)
 
-        y_step = 12.0
-        y_height = 8.0
+        y_step = 10.0
+        y_height = 6.2
         y_positions = {machine: i * y_step for i, machine in enumerate(machines)}
 
         order_ids = list(schedule["order_id"].astype(str).dropna().unique()) if "order_id" in schedule else []
-        color_cycle = [f"C{i % 10}" for i in range(max(1, len(order_ids)))]
-        order_to_color = {order_id: color_cycle[i] for i, order_id in enumerate(order_ids)}
+        order_to_color = color_map or self.build_order_color_map(order_ids)
 
         label_threshold_minutes = self._label_threshold_minutes(len(schedule))
 
@@ -90,7 +91,7 @@ class GanttView(QWidget):
                 (y_positions[machine], y_height),
                 facecolors=order_to_color.get(order_id, "C0"),
                 edgecolors="black" if is_changed else "none",
-                linewidth=1.2 if is_changed else 0.0,
+                linewidth=1.1 if is_changed else 0.0,
                 alpha=0.92,
             )
 
@@ -105,7 +106,7 @@ class GanttView(QWidget):
                     label,
                     ha="center",
                     va="center",
-                    fontsize=8,
+                    fontsize=7,
                     color="white",
                     clip_on=True,
                 )
@@ -115,24 +116,39 @@ class GanttView(QWidget):
         if replan_time is not None and not pd.isna(replan_time):
             replan_ts = pd.to_datetime(replan_time)
             replan_x = date2num(replan_ts)
-            ax.axvline(replan_x, linestyle="--", linewidth=1.7)
+            ax.axvline(replan_x, linestyle="--", linewidth=1.5)
             ymax = max(y_positions.values()) + y_height if y_positions else 1
-            ax.text(replan_x, ymax + 4.5, "replan time", rotation=90, va="bottom", ha="right", fontsize=9)
+            ax.text(replan_x, ymax + 2.7, "replan time", rotation=90, va="bottom", ha="right", fontsize=8)
 
-        ax.set_title(title, fontsize=15, fontweight="bold")
+        ax.set_title(title, fontsize=14, fontweight="bold", pad=7)
         ax.set_yticks([y_positions[m] + y_height / 2 for m in machines])
         ax.set_yticklabels(machines)
-        ax.set_xlabel("Time", fontsize=11)
-        ax.set_ylabel("Machine", fontsize=11)
+        ax.set_xlabel("Time", fontsize=10, labelpad=4)
+        ax.set_ylabel("Machine", fontsize=10)
         ax.xaxis_date()
         ax.xaxis.set_major_formatter(DateFormatter("%m-%d %H:%M"))
-        ax.tick_params(axis="x", labelsize=10)
-        ax.tick_params(axis="y", labelsize=11)
-        ax.grid(True, axis="x", linestyle="--", alpha=0.25)
+        ax.tick_params(axis="x", labelsize=8)
+        ax.tick_params(axis="y", labelsize=10)
+        ax.grid(True, axis="x", linestyle="--", alpha=0.22)
         ax.margins(x=0.01)
-        ax.set_ylim(-3, max(y_positions.values()) + y_height + 8 if machines else 10)
+        ax.set_ylim(-2.5, max(y_positions.values()) + y_height + 5 if machines else 10)
+
+        # Fixed margins avoid clipped axis labels in the Qt canvas.
+        self.figure.subplots_adjust(left=0.13, right=0.985, top=0.88, bottom=0.24)
         self.figure.autofmt_xdate(rotation=25, ha="right")
         self.canvas.draw_idle()
+
+    @staticmethod
+    def build_order_color_map(order_ids) -> Dict[str, str]:
+        """Build a deterministic color map for order IDs.
+
+        The same order_id gets the same color in baseline and rescheduled plots.
+        Matplotlib's default Tableau palette is repeated when there are more
+        than 10 orders.
+        """
+        unique_order_ids = sorted({str(order_id) for order_id in order_ids if str(order_id) and str(order_id).lower() != "nan"})
+        color_cycle = [f"C{i % 10}" for i in range(max(1, len(unique_order_ids)))]
+        return {order_id: color_cycle[i] for i, order_id in enumerate(unique_order_ids)}
 
     @staticmethod
     def _label_threshold_minutes(operation_count: int) -> float:
@@ -183,17 +199,17 @@ class GanttView(QWidget):
             width = duration / (24 * 60)
             ax.broken_barh(
                 [(start, width)],
-                (y_positions[machine] - 1.0, y_height + 2.0),
+                (y_positions[machine] - 0.8, y_height + 1.6),
                 facecolors="red",
                 edgecolors="red",
                 alpha=0.22,
             )
             ax.text(
                 start + width / 2,
-                y_positions[machine] + y_height + 1.7,
+                y_positions[machine] + y_height + 1.0,
                 "downtime",
                 ha="center",
                 va="bottom",
-                fontsize=8,
+                fontsize=7,
                 color="red",
             )

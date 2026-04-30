@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import pandas as pd
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QScrollArea,
     QSpinBox,
     QDoubleSpinBox,
@@ -129,6 +130,12 @@ class MainWindow(QMainWindow):
         self.service = SchedulerService(repo_root)
         self.active_thread: Optional[QThread] = None
         self.active_worker: Optional[Worker] = None
+        self.progress_timer = QTimer(self)
+        self.progress_timer.setInterval(500)
+        self.progress_timer.timeout.connect(self._update_progress)
+        self.progress_elapsed_seconds = 0.0
+        self.progress_limit_seconds = 1.0
+        self.progress_busy_message = ""
 
         self._build_actions()
         self._build_ui()
@@ -263,9 +270,21 @@ class MainWindow(QMainWindow):
         self.export_button = QPushButton("Export results")
         self.export_button.setObjectName("SecondaryButton")
         self.export_button.clicked.connect(self.export_results)
+
+        self.progress_label = QLabel("Idle")
+        self.progress_label.setStyleSheet("color: #5a6472; font-size: 11px;")
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("idle")
+        self.progress_bar.setTextVisible(True)
+
         actions_layout.addWidget(self.solve_button)
         actions_layout.addWidget(self.reschedule_button)
         actions_layout.addWidget(self.export_button)
+        actions_layout.addSpacing(6)
+        actions_layout.addWidget(self.progress_label)
+        actions_layout.addWidget(self.progress_bar)
 
         layout.addWidget(data_group)
         layout.addWidget(solver_group)
@@ -475,6 +494,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Solver is already running", "Wait until the current solve finishes.")
             return
         self._set_busy(True)
+        self._start_progress(busy_message, float(self.time_limit_spin.value()))
         self.statusBar().showMessage(busy_message)
         self.append_log(busy_message)
 
@@ -498,20 +518,61 @@ class MainWindow(QMainWindow):
         self.solve_button.setDisabled(busy)
         self.reschedule_button.setDisabled(busy)
         self.export_button.setDisabled(busy)
+        self.solve_button.setText("Solver is running..." if busy else "Solve baseline plan")
+        self.reschedule_button.setText("Solver is running..." if busy else "Run rescheduling")
+
+
+    def _start_progress(self, message: str, limit_seconds: float) -> None:
+        self.progress_elapsed_seconds = 0.0
+        self.progress_limit_seconds = max(1.0, float(limit_seconds))
+        self.progress_busy_message = message
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setFormat("0% · estimating")
+        self.progress_label.setText(message)
+        self.progress_timer.start()
+
+    def _update_progress(self) -> None:
+        if self.active_thread is None:
+            return
+        self.progress_elapsed_seconds += self.progress_timer.interval() / 1000.0
+        pct = min(99, int(100.0 * self.progress_elapsed_seconds / max(1.0, self.progress_limit_seconds)))
+        remaining = max(0.0, self.progress_limit_seconds - self.progress_elapsed_seconds)
+        self.progress_bar.setValue(pct)
+        self.progress_bar.setFormat(f"{pct}% · elapsed {self.progress_elapsed_seconds:.0f}s · <= {remaining:.0f}s left")
+        self.progress_label.setText(self.progress_busy_message)
+
+    def _finish_progress(self, success: bool = True) -> None:
+        self.progress_timer.stop()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(100 if success else 0)
+        self.progress_bar.setFormat("done" if success else "failed")
+        self.progress_label.setText("Finished" if success else "Failed")
 
     @Slot()
     def _clear_active_thread(self) -> None:
+        self._finish_progress(success=True)
         self.active_thread = None
         self.active_worker = None
         self._set_busy(False)
 
     @Slot(str)
     def _on_worker_failed(self, error_text: str) -> None:
+        self._finish_progress(success=False)
         self.status_label.setText("Status: failed")
         self.statusBar().showMessage("Solver failed. See Diagnostics tab.")
         self.append_log(error_text)
         self.tabs.setCurrentWidget(self.solver_log.parentWidget())
         QMessageBox.critical(self, "Solver failed", "The solver call failed. See the Diagnostics tab for the traceback.")
+
+    def _build_shared_order_color_map(self):
+        """Use one stable order-to-color mapping for all Gantt charts."""
+        order_ids = set()
+        if self.state.baseline is not None and not self.state.baseline.schedule.empty:
+            order_ids.update(self.state.baseline.schedule.get("order_id", pd.Series(dtype=str)).astype(str).dropna().tolist())
+        if self.state.replanned is not None and not self.state.replanned.schedule.empty:
+            order_ids.update(self.state.replanned.schedule.get("order_id", pd.Series(dtype=str)).astype(str).dropna().tolist())
+        return GanttView.build_order_color_map(order_ids)
 
     @Slot(object)
     def _on_baseline_done(self, run) -> None:
@@ -527,7 +588,7 @@ class MainWindow(QMainWindow):
         self.compare_table.set_dataframe(build_kpi_comparison(run.kpis, None))
         self.change_table.set_dataframe(build_change_table(None, None))
         self.diagnostics_table.set_dataframe(pd.DataFrame([run.validation]))
-        self.baseline_gantt.plot_schedule(run.schedule, title="Baseline production schedule")
+        self.baseline_gantt.plot_schedule(run.schedule, title="Baseline production schedule", color_map=self._build_shared_order_color_map())
         self.replanned_gantt.plot_empty("Run rescheduling to show the repaired plan")
         self.tabs.setCurrentWidget(self.baseline_gantt)
 
