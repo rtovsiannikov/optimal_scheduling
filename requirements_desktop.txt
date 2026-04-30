@@ -1,0 +1,12 @@
+# Base requirements from the existing project:
+pandas
+numpy
+matplotlib
+ortools
+jupyter
+
+# Desktop GUI layer:
+PySide6
+
+# Optional, only needed to build .exe locally:
+pyinstaller
