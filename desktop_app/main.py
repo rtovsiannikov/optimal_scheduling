@@ -144,6 +144,7 @@ class MainWindow(QMainWindow):
         self.active_recommendation_target: Optional[str] = None
         self.current_otif_breakdown = pd.DataFrame()
         self.selected_order_id: Optional[str] = None
+        self.selected_recommendation: Optional[dict] = None
 
         self._build_actions()
         self._build_ui()
@@ -331,12 +332,14 @@ class MainWindow(QMainWindow):
         self.tabs.setDocumentMode(True)
         self.baseline_gantt = GanttView()
         self.replanned_gantt = GanttView()
+        self.whatif_gantt = GanttView()
         self.compare_table = DataFrameTable()
         self.orders_table = DataFrameTable()
         self.machines_table = DataFrameTable()
         self.change_table = DataFrameTable()
         self.recommendations_table = DataFrameTable()
         self.recommendations_table.set_word_wrap(True)
+        self.recommendations_table.row_selected.connect(self._on_recommendation_selected)
         self.root_causes_table = DataFrameTable()
         self.root_causes_table.set_word_wrap(True)
         self.otif_breakdown_table = DataFrameTable()
@@ -354,12 +357,14 @@ class MainWindow(QMainWindow):
 
         self.baseline_tab = self._wrap_scrollable(self.baseline_gantt)
         self.replanned_tab = self._wrap_scrollable(self.replanned_gantt)
+        self.whatif_tab = self._wrap_scrollable(self.whatif_gantt)
         self.compare_tab = self._build_compare_tab()
         self.recommendations_tab = self._build_recommendations_tab()
         self.diagnostics_tab = self._build_diagnostics_tab()
 
         self.tabs.addTab(self.baseline_tab, "Baseline Plan")
         self.tabs.addTab(self.replanned_tab, "Rescheduled Plan")
+        self.tabs.addTab(self.whatif_tab, "What-if Plan")
         self.tabs.addTab(self.compare_tab, "Compare")
         self.tabs.addTab(self.recommendations_tab, "Recommendations")
         self.tabs.addTab(self.orders_table, "Orders")
@@ -419,6 +424,18 @@ class MainWindow(QMainWindow):
         actions_layout = QVBoxLayout(self.recommendation_actions_tab)
         actions_layout.setContentsMargins(0, 0, 0, 0)
         actions_layout.addWidget(QLabel("Recommended actions"))
+
+        follow_layout = QHBoxLayout()
+        self.follow_recommendation_button = QPushButton("Run selected recommendation as what-if")
+        self.follow_recommendation_button.setObjectName("SecondaryButton")
+        self.follow_recommendation_button.setEnabled(False)
+        self.follow_recommendation_button.clicked.connect(self.run_selected_recommendation)
+        self.selected_recommendation_label = QLabel("Select a recommendation row to preview and run a supported what-if.")
+        self.selected_recommendation_label.setStyleSheet("color: #5a6472; padding: 4px;")
+        follow_layout.addWidget(self.follow_recommendation_button)
+        follow_layout.addWidget(self.selected_recommendation_label, stretch=1)
+        actions_layout.addLayout(follow_layout)
+
         actions_layout.addWidget(self.recommendations_table, stretch=1)
 
         self.recommendation_root_causes_tab = QWidget()
@@ -505,6 +522,7 @@ class MainWindow(QMainWindow):
         self.state.bundle = bundle
         self.state.baseline = None
         self.state.replanned = None
+        self.state.whatif = None
         self.bundle_path_edit.setText(str(bundle_dir))
         self.bundle_label.setText(f"Dataset: {bundle_dir.name}")
         self.status_label.setText("Status: bundle loaded")
@@ -532,6 +550,11 @@ class MainWindow(QMainWindow):
         self.diagnostics_table.set_dataframe(pd.DataFrame())
         self.baseline_gantt.plot_empty("Baseline schedule has not been solved yet")
         self.replanned_gantt.plot_empty("Reschedule has not been solved yet")
+        self.whatif_gantt.plot_empty("Run a selected recommendation to show a what-if plan")
+        self.selected_recommendation = None
+        if hasattr(self, "follow_recommendation_button"):
+            self.follow_recommendation_button.setEnabled(False)
+            self.selected_recommendation_label.setText("Select a recommendation row to preview and run a supported what-if.")
         self.kpi_panel.set_kpis(None)
 
     @Slot()
@@ -586,6 +609,8 @@ class MainWindow(QMainWindow):
                 self.service.export_run(self.state.baseline, output, "baseline")
             if self.state.replanned is not None:
                 self.service.export_run(self.state.replanned, output, "replanned")
+            if self.state.whatif is not None:
+                self.service.export_run(self.state.whatif, output, "whatif")
         except Exception as exc:
             QMessageBox.critical(self, "Export failed", str(exc))
             return
@@ -669,10 +694,8 @@ class MainWindow(QMainWindow):
         self.export_button.setDisabled(busy)
         if hasattr(self, "legend_button"):
             self.legend_button.setDisabled(busy)
-        self.solve_button.setText("Solver is running..." if busy else "Solve baseline plan")
-        self.reschedule_button.setText("Solver is running..." if busy else "Run rescheduling")
-        if hasattr(self, "legend_button"):
-            self.legend_button.setDisabled(busy)
+        if hasattr(self, "follow_recommendation_button"):
+            self.follow_recommendation_button.setDisabled(busy or not bool(self.selected_recommendation))
         self.solve_button.setText("Solver is running..." if busy else "Solve baseline plan")
         self.reschedule_button.setText("Solver is running..." if busy else "Run rescheduling")
 
@@ -730,12 +753,15 @@ class MainWindow(QMainWindow):
             order_ids.update(self.state.baseline.schedule.get("order_id", pd.Series(dtype=str)).astype(str).dropna().tolist())
         if self.state.replanned is not None and not self.state.replanned.schedule.empty:
             order_ids.update(self.state.replanned.schedule.get("order_id", pd.Series(dtype=str)).astype(str).dropna().tolist())
+        if self.state.whatif is not None and not self.state.whatif.schedule.empty:
+            order_ids.update(self.state.whatif.schedule.get("order_id", pd.Series(dtype=str)).astype(str).dropna().tolist())
         return GanttView.build_order_color_map(order_ids)
 
     @Slot(object)
     def _on_baseline_done(self, run) -> None:
         self.state.baseline = run
         self.state.replanned = None
+        self.state.whatif = None
         self.status_label.setText(f"Status: baseline {run.status}")
         self.statusBar().showMessage(f"Baseline solved: {run.status} in {run.solve_time_seconds:.2f} s")
         self.append_log(self._format_run_log("Baseline", run))
@@ -757,6 +783,7 @@ class MainWindow(QMainWindow):
             highlight_order_id=self.selected_order_id,
         )
         self.replanned_gantt.plot_empty("Run rescheduling to show the repaired plan")
+        self.whatif_gantt.plot_empty("Select and run a recommendation to evaluate a what-if plan")
         self.tabs.setCurrentWidget(self.recommendations_tab if self._has_missed_otif(run) else self.baseline_tab)
         if self._has_missed_otif(run):
             self.recommendation_tabs.setCurrentWidget(self.recommendation_otif_tab)
@@ -797,10 +824,164 @@ class MainWindow(QMainWindow):
         if self._has_missed_otif(run):
             self.recommendation_tabs.setCurrentWidget(self.recommendation_otif_tab)
 
+
+    @Slot(dict)
+    def _on_recommendation_selected(self, record: dict) -> None:
+        """Store the selected recommendation and prepare the what-if button."""
+
+        self.selected_recommendation = dict(record or {})
+        title = str(self.selected_recommendation.get("recommendation", "Selected recommendation")).strip()
+        action_type = str(self.selected_recommendation.get("action_type", "manual_review")).strip() or "manual_review"
+        solver_action = self._record_bool(self.selected_recommendation.get("solver_action", False))
+        target_bits = []
+        for key, label in [
+            ("target_machine_group", "group"),
+            ("target_machine_id", "machine"),
+            ("target_order_id", "order"),
+        ]:
+            value = str(self.selected_recommendation.get(key, "")).strip()
+            if value and value.lower() not in {"nan", "none", "—"}:
+                target_bits.append(f"{label}: {value}")
+        suffix = " · ".join(target_bits)
+        if suffix:
+            suffix = f" ({suffix})"
+        self.selected_recommendation_label.setText(f"Selected: {title} [{action_type}]{suffix}")
+        self.follow_recommendation_button.setEnabled(True)
+        if solver_action:
+            self.follow_recommendation_button.setText("Run selected recommendation as what-if")
+        else:
+            self.follow_recommendation_button.setText("Open selected recommendation guidance")
+
+    @Slot()
+    def run_selected_recommendation(self) -> None:
+        """Apply the selected recommendation as a temporary what-if scenario."""
+
+        if not self._require_bundle():
+            return
+        if not self.selected_recommendation:
+            QMessageBox.information(self, "No recommendation selected", "Select a row in the Actions table first.")
+            return
+        if self.active_recommendation_run is None or self.active_recommendation_target is None:
+            QMessageBox.information(self, "No active run", "Solve a baseline or rescheduling run before applying recommendations.")
+            return
+
+        solver_action = self._record_bool(self.selected_recommendation.get("solver_action", False))
+        if not solver_action:
+            QMessageBox.information(
+                self,
+                "Manual recommendation",
+                self._format_manual_recommendation_message(self.selected_recommendation),
+            )
+            self._focus_recommendation_targets(self.selected_recommendation)
+            return
+
+        settings = self._read_solver_settings()
+        bundle_dir = self.state.bundle_dir
+        assert bundle_dir is not None
+        source_target = self.active_recommendation_target
+        if source_target == "whatif":
+            source_target = str(self.active_recommendation_run.metadata.get("what_if_source_target", "baseline"))
+        scenario_name = "baseline_no_disruption"
+        replan_time = None
+        if source_target == "replanned":
+            scenario_name = str(self.active_recommendation_run.metadata.get("scenario_name", self.scenario_combo.currentText()))
+            replan_time = self.active_recommendation_run.metadata.get("replan_time")
+
+        baseline_schedule = self.state.baseline.schedule.copy() if self.state.baseline is not None else None
+        title = str(self.selected_recommendation.get("recommendation", "recommendation"))
+        self._run_in_thread(
+            lambda: self.service.solve_recommendation_whatif(
+                bundle_dir=bundle_dir,
+                recommendation=dict(self.selected_recommendation),
+                source_target=source_target,
+                settings=settings,
+                baseline_schedule_df=baseline_schedule,
+                scenario_name=scenario_name,
+                replan_time=replan_time,
+            ),
+            on_success=self._on_whatif_done,
+            busy_message=f"Running what-if for recommendation: {title}",
+        )
+
+    @Slot(object)
+    def _on_whatif_done(self, run) -> None:
+        """Show a recommendation-driven what-if result."""
+
+        self.state.whatif = run
+        self.status_label.setText(f"Status: what-if {run.status}")
+        description = str(run.metadata.get("what_if_description", "Recommendation what-if")) if run.metadata else "Recommendation what-if"
+        self.statusBar().showMessage(f"What-if solved: {run.status} in {run.solve_time_seconds:.2f} s")
+        self.append_log(self._format_run_log("Recommendation what-if", run))
+        self.append_log(f"  what-if: {description}")
+
+        baseline_kpis = self.state.baseline.kpis if self.state.baseline else None
+        baseline_schedule = self.state.baseline.schedule if self.state.baseline else None
+        self.kpi_panel.set_kpis(run.kpis)
+        self.orders_table.set_dataframe(run.order_summary if not run.order_summary.empty else self.state.bundle.orders)
+        self.machines_table.set_dataframe(build_machine_utilization(run.schedule))
+        self.compare_table.set_dataframe(build_kpi_comparison(baseline_kpis, run.kpis))
+        self.change_table.set_dataframe(build_change_table(baseline_schedule, run.schedule))
+        self.diagnostics_table.set_dataframe(pd.DataFrame([run.validation]))
+        self._show_recommendations(run, target="whatif")
+
+        late_orders, partial_orders = self._failure_order_sets(run)
+        scenario_name = str(run.metadata.get("scenario_name", "baseline_no_disruption")) if run.metadata else "baseline_no_disruption"
+        replan_time = run.metadata.get("replan_time") if run.metadata else None
+        downtime_df = self.state.bundle.downtime_events if self.state.bundle is not None and scenario_name != "baseline_no_disruption" else None
+        self.whatif_gantt.plot_schedule(
+            run.schedule,
+            title="Recommendation what-if plan",
+            downtime_df=downtime_df,
+            scenario_name=scenario_name,
+            replan_time=replan_time,
+            previous_schedule_df=baseline_schedule,
+            color_map=self._build_shared_order_color_map(),
+            late_order_ids=late_orders,
+            partial_order_ids=partial_orders,
+            highlight_order_id=self.selected_order_id,
+        )
+        self.tabs.setCurrentWidget(self.whatif_tab)
+        if self._has_missed_otif(run):
+            self.tabs.setCurrentWidget(self.recommendations_tab)
+            self.recommendation_tabs.setCurrentWidget(self.recommendation_otif_tab)
+
+    def _focus_recommendation_targets(self, recommendation: dict) -> None:
+        """Move the user to relevant OTIF rows for manual recommendations."""
+
+        target_ids = str(recommendation.get("target_order_ids", recommendation.get("target_order_id", ""))).strip()
+        if target_ids:
+            self._apply_otif_filter("failures", select_tab=True)
+
+    @staticmethod
+    def _format_manual_recommendation_message(recommendation: dict) -> str:
+        title = str(recommendation.get("recommendation", "Selected recommendation")).strip()
+        evidence = str(recommendation.get("evidence", "")).strip()
+        suggested = str(recommendation.get("suggested_action", "")).strip()
+        target_orders = str(recommendation.get("target_order_ids", recommendation.get("target_order_id", ""))).strip()
+        lines = [title]
+        if evidence:
+            lines.append(f"Evidence: {evidence}")
+        if suggested:
+            lines.append(f"Action: {suggested}")
+        if target_orders and target_orders.lower() not in {"nan", "none"}:
+            lines.append(f"Affected order(s): {target_orders}")
+        lines.append("This recommendation is a business action, so it does not automatically change the CP-SAT input data.")
+        return "\n\n".join(lines)
+
+    @staticmethod
+    def _record_bool(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
     def _show_recommendations(self, run, target: str) -> None:
         self.active_recommendation_run = run
         self.active_recommendation_target = target
         self.selected_order_id = None
+        self.selected_recommendation = None
+        if hasattr(self, "follow_recommendation_button"):
+            self.follow_recommendation_button.setEnabled(False)
+            self.selected_recommendation_label.setText("Select a recommendation row to preview and run a supported what-if.")
         self.recommendation_summary.setPlainText(run.recommendation_summary or "No recommendation summary available.")
         self.recommendations_table.set_dataframe(run.recommendations)
         self.root_causes_table.set_dataframe(run.root_causes)
@@ -870,10 +1051,12 @@ class MainWindow(QMainWindow):
         scenario_name = str(run.metadata.get("scenario_name", self.scenario_combo.currentText()))
         replan_time = run.metadata.get("replan_time")
         baseline_schedule = self.state.baseline.schedule if self.state.baseline else None
-        self.replanned_gantt.plot_schedule(
+        gantt = self.whatif_gantt if target == "whatif" else self.replanned_gantt
+        title = "Recommendation what-if plan" if target == "whatif" else f"Rescheduled production plan: {scenario_name}"
+        gantt.plot_schedule(
             run.schedule,
-            title=f"Rescheduled production plan: {scenario_name}",
-            downtime_df=self.state.bundle.downtime_events,
+            title=title,
+            downtime_df=self.state.bundle.downtime_events if scenario_name != "baseline_no_disruption" else None,
             scenario_name=scenario_name,
             replan_time=replan_time,
             previous_schedule_df=baseline_schedule,

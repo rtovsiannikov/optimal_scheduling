@@ -59,3 +59,4 @@ class AppState:
     bundle: Optional[Any] = None
     baseline: Optional[AppRun] = None
     replanned: Optional[AppRun] = None
+    whatif: Optional[AppRun] = None

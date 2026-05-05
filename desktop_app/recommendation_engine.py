@@ -103,6 +103,7 @@ def generate_recommendations(
         impacted_orders = int(bottleneck.get("missed_orders", 0))
         workload = float(bottleneck.get("late_work_minutes", 0.0))
         overtime_hours = max(1, int(math.ceil(min(max(workload * 0.25, 60.0), 480.0) / 60.0)))
+        target_order_ids = _target_order_ids_for_resource(schedule, missed_orders, machine_id)
 
         root_causes.append(
             _root_cause(
@@ -132,6 +133,13 @@ def generate_recommendations(
                 ),
                 expected_effect="Usually the best first recovery scenario when OTIF-C is below 100%.",
                 confidence="High" if impacted_orders >= 2 else "Medium",
+                action_type="add_overtime",
+                target_machine_id=machine_id,
+                target_machine_group=machine_group,
+                target_order_ids=target_order_ids,
+                target_hours=float(overtime_hours),
+                target_minutes=float(overtime_hours * 60),
+                solver_action=True,
             )
         )
 
@@ -167,6 +175,10 @@ def generate_recommendations(
                 suggested_action="Discuss split delivery or partial shipment with customer service for these orders.",
                 expected_effect="Improves service recovery even when strict in-full OTIF remains missed.",
                 confidence="High",
+                action_type="partial_shipment",
+                target_order_id=str(best.get("order_id", "")),
+                target_order_ids=",".join(partial["order_id"].astype(str).tolist()),
+                solver_action=False,
             )
         )
         root_causes.append(
@@ -195,6 +207,11 @@ def generate_recommendations(
                 suggested_action="Use the computed completion time as the first renegotiation target or test extra capacity before changing the promise.",
                 expected_effect="Removes unrealistic commitments from the OTIF-C discussion if capacity cannot be changed.",
                 confidence="Medium",
+                action_type="extend_due_date",
+                target_order_id=str(due_date_candidate.get("order_id", "")),
+                target_hours=float(max(1.0, math.ceil(delay / 60.0))),
+                target_minutes=float(max(60.0, math.ceil(delay / 60.0) * 60.0)),
+                solver_action=True,
             )
         )
 
@@ -213,6 +230,9 @@ def generate_recommendations(
                 suggested_action="Qualify another machine, cross-train operators, or update the compatible-machine list for this operation group.",
                 expected_effect="Reduces future bottleneck risk and gives CP-SAT more feasible assignments.",
                 confidence="Medium",
+                action_type="add_routing_capacity",
+                target_machine_group=str(routing["machine_group"]),
+                solver_action=True,
             )
         )
         root_causes.append(
@@ -247,6 +267,11 @@ def generate_recommendations(
                 suggested_action="After the event, reserve capacity on the next operation group for impacted orders instead of only moving the interrupted operation later.",
                 expected_effect="Reduces ripple effects in event-driven rescheduling.",
                 confidence="Medium",
+                action_type="add_downtime_recovery_capacity",
+                target_machine_id=str(downtime["machine_id"]),
+                target_hours=2.0,
+                target_minutes=120.0,
+                solver_action=True,
             )
         )
         root_causes.append(
@@ -259,23 +284,6 @@ def generate_recommendations(
             )
         )
 
-    stability = _stability_diagnostic(previous_schedule, schedule, missed_orders, kpis)
-    if stability is not None:
-        recommendations.append(
-            _recommendation(
-                severity="Low",
-                category="Rescheduling policy",
-                recommendation="Run a what-if with less schedule stability pressure",
-                why_it_matters="A very stable reschedule is easier to execute, but it may preserve a plan that can no longer meet OTIF-C.",
-                evidence=(
-                    f"Only {stability['changed_operations']} of {stability['compared_operations']} comparable operations changed; "
-                    f"average start shift is {_minutes(stability['average_shift_minutes'])}."
-                ),
-                suggested_action="Try allowing more not-started operations to move, then compare OTIF-C improvement against changed operations.",
-                expected_effect="Shows the trade-off between plan stability and customer-service recovery.",
-                confidence="Medium",
-            )
-        )
 
     priority = _priority_conflict_diagnostic(missed_orders, order_summary, schedule)
     if priority is not None:
@@ -292,6 +300,10 @@ def generate_recommendations(
                 suggested_action="Confirm whether the current priority labels match the real commercial escalation rules.",
                 expected_effect="Improves schedule decisions when not all orders can be saved.",
                 confidence="Low",
+                action_type="boost_order_priority",
+                target_machine_id=str(priority.get("machine_id", "")),
+                target_order_id=str(priority.get("missed_order_id", "")),
+                solver_action=True,
             )
         )
 
@@ -303,8 +315,8 @@ def generate_recommendations(
                 recommendation="No dominant single cause detected",
                 why_it_matters="The missed OTIF-C appears to be distributed across multiple resources or constraints.",
                 evidence=_format_kpi_evidence(kpis, order_summary),
-                suggested_action="Run targeted what-if scenarios: overtime on top utilized machines, due-date extension, and relaxed rescheduling stability.",
-                expected_effect="Helps separate capacity, promise-date, and stability effects.",
+                suggested_action="Run targeted what-if scenarios: overtime on top utilized machines, due-date extension, and routing-capacity expansion.",
+                expected_effect="Helps separate capacity, promise-date, and routing-flexibility effects.",
                 confidence="Medium",
             )
         )
@@ -324,6 +336,10 @@ def _empty_schedule_recommendations(order_summary: pd.DataFrame, kpis: Dict[str,
             suggested_action="Increase the solver time limit, extend the planning horizon/shifts, or check operations with no feasible machine/shift assignment.",
             expected_effect="Restores a feasible baseline before detailed OTIF-C recovery actions are evaluated.",
             confidence="High",
+            action_type="extend_horizon_capacity",
+            target_hours=4.0,
+            target_minutes=240.0,
+            solver_action=True,
         )
     ]
     root_causes = [
@@ -535,6 +551,25 @@ def _late_order_work(schedule: pd.DataFrame, missed_orders: pd.DataFrame) -> pd.
         .reset_index()
         .rename(columns={"machine_group_required": "machine_group"})
     )
+
+
+
+
+def _target_order_ids_for_resource(schedule: pd.DataFrame, missed_orders: pd.DataFrame, machine_id: str) -> str:
+    """Return comma-separated missed orders that touch a machine.
+
+    This is used by the GUI what-if layer to explain which orders the selected
+    recommendation is trying to recover.
+    """
+
+    if schedule.empty or missed_orders.empty or "order_id" not in schedule.columns or "machine_id" not in schedule.columns:
+        return ""
+    missed_ids = set(missed_orders["order_id"].astype(str))
+    rows = schedule[
+        schedule["order_id"].astype(str).isin(missed_ids)
+        & schedule["machine_id"].astype(str).eq(str(machine_id))
+    ]
+    return ",".join(sorted(rows["order_id"].astype(str).dropna().unique().tolist()))
 
 
 def _top_bottleneck(late_work: pd.DataFrame, utilization: pd.DataFrame) -> Optional[dict[str, Any]]:
@@ -829,6 +864,7 @@ def _finalize_bundle(
     rec_df = pd.DataFrame(recommendations)
     root_df = pd.DataFrame(root_causes)
     rec_df = _sort_by_severity(rec_df)
+    rec_df = _order_recommendation_columns(rec_df)
     root_df = _sort_by_severity(root_df)
     summary = _build_summary(order_summary, kpis, bottleneck, rec_df)
     otif_breakdown = _build_otif_breakdown(order_summary)
@@ -838,6 +874,34 @@ def _finalize_bundle(
         root_causes=root_df,
         otif_breakdown=otif_breakdown,
     )
+
+
+
+
+def _order_recommendation_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    preferred = [
+        "severity",
+        "category",
+        "recommendation",
+        "action_type",
+        "solver_action",
+        "target_machine_group",
+        "target_machine_id",
+        "target_order_id",
+        "target_order_ids",
+        "target_hours",
+        "evidence",
+        "suggested_action",
+        "expected_effect",
+        "confidence",
+        "why_it_matters",
+        "target_minutes",
+    ]
+    ordered = [col for col in preferred if col in df.columns]
+    rest = [col for col in df.columns if col not in ordered]
+    return df[ordered + rest]
 
 
 def _sort_by_severity(df: pd.DataFrame) -> pd.DataFrame:
@@ -900,11 +964,34 @@ def _recommendation(
     suggested_action: str,
     expected_effect: str,
     confidence: str,
+    action_type: str = "manual_review",
+    target_machine_id: str = "",
+    target_machine_group: str = "",
+    target_order_id: str = "",
+    target_order_ids: str = "",
+    target_hours: float = math.nan,
+    target_minutes: float = math.nan,
+    solver_action: bool = False,
 ) -> dict[str, Any]:
+    """Build one recommendation row.
+
+    The first columns are meant for planners.  The action_* and target_* columns
+    are intentionally machine-readable so the desktop app can execute supported
+    recommendations as deterministic what-if scenarios.
+    """
+
     return {
         "severity": severity,
         "category": category,
         "recommendation": recommendation,
+        "action_type": action_type,
+        "solver_action": bool(solver_action),
+        "target_machine_id": target_machine_id,
+        "target_machine_group": target_machine_group,
+        "target_order_id": target_order_id,
+        "target_order_ids": target_order_ids,
+        "target_hours": target_hours,
+        "target_minutes": target_minutes,
         "why_it_matters": why_it_matters,
         "evidence": evidence,
         "suggested_action": suggested_action,
