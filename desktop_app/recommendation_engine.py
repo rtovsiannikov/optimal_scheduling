@@ -26,6 +26,7 @@ class RecommendationBundle:
     summary: str
     recommendations: pd.DataFrame
     root_causes: pd.DataFrame
+    otif_breakdown: pd.DataFrame
 
 
 def generate_recommendations(
@@ -338,6 +339,7 @@ def _empty_schedule_recommendations(order_summary: pd.DataFrame, kpis: Dict[str,
         summary="No feasible operation-level plan was returned. Fix feasibility first, then run OTIF-C recovery diagnostics.",
         recommendations=pd.DataFrame(recommendations),
         root_causes=pd.DataFrame(root_causes),
+        otif_breakdown=_build_otif_breakdown(order_summary),
     )
 
 
@@ -391,6 +393,14 @@ def _normalize_order_summary(summary: Optional[pd.DataFrame], orders: pd.DataFra
     out = summary.copy()
     if "order_id" in out.columns:
         out["order_id"] = out["order_id"].astype(str)
+    if not orders.empty and "order_id" in out.columns and "order_id" in orders.columns:
+        extra_columns = [
+            col
+            for col in ["order_type", "order_quantity", "promised_date", "deadline", "release_time", "priority_weight"]
+            if col in orders.columns and col not in out.columns
+        ]
+        if extra_columns:
+            out = out.merge(orders[["order_id", *extra_columns]], on="order_id", how="left")
     for column in ["deadline", "promised_date", "completion_time", "release_time"]:
         if column in out.columns:
             out[column] = pd.to_datetime(out[column], errors="coerce")
@@ -694,6 +704,121 @@ def _priority_conflict_diagnostic(missed_orders: pd.DataFrame, order_summary: pd
     }
 
 
+
+def _build_otif_breakdown(order_summary: pd.DataFrame) -> pd.DataFrame:
+    """Return one explicit row per order explaining OTIF-C failure mode.
+
+    OTIF-C is easy to misread from a single percentage.  This table separates
+    the two business conditions that form the metric:
+    * on-time: the computed completion time is not later than the promise date;
+    * in-full: the quantity ready by the promise date covers the ordered quantity.
+    """
+
+    columns = [
+        "order_id",
+        "order_type",
+        "priority_weight",
+        "promised_date",
+        "completion_time",
+        "order_quantity",
+        "qty_ready_by_due",
+        "fill_rate_by_due",
+        "on_time",
+        "in_full",
+        "otif",
+        "lateness_hours",
+        "failure_reason",
+    ]
+    if order_summary is None or order_summary.empty:
+        return pd.DataFrame(columns=columns)
+
+    df = order_summary.copy()
+    if "order_id" not in df.columns:
+        return pd.DataFrame(columns=columns)
+    df["order_id"] = df["order_id"].astype(str)
+
+    if "promised_date" not in df.columns and "deadline" in df.columns:
+        df["promised_date"] = df["deadline"]
+    if "deadline" not in df.columns and "promised_date" in df.columns:
+        df["deadline"] = df["promised_date"]
+    for column in ["promised_date", "deadline", "completion_time"]:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], errors="coerce")
+
+    if "order_quantity" not in df.columns:
+        df["order_quantity"] = 1.0
+    df["order_quantity"] = pd.to_numeric(df["order_quantity"], errors="coerce").fillna(1.0).clip(lower=1.0)
+
+    if "completed_quantity_by_deadline" in df.columns:
+        df["qty_ready_by_due"] = pd.to_numeric(df["completed_quantity_by_deadline"], errors="coerce").fillna(0.0)
+    elif "fill_rate_by_deadline" in df.columns:
+        fill = pd.to_numeric(df["fill_rate_by_deadline"], errors="coerce").fillna(0.0).clip(lower=0.0)
+        df["qty_ready_by_due"] = fill * df["order_quantity"]
+    elif "otif" in df.columns:
+        df["qty_ready_by_due"] = _bool_series(df["otif"]).astype(float) * df["order_quantity"]
+    else:
+        df["qty_ready_by_due"] = 0.0
+
+    if "fill_rate_by_deadline" in df.columns:
+        df["fill_rate_by_due"] = pd.to_numeric(df["fill_rate_by_deadline"], errors="coerce").fillna(0.0)
+    else:
+        df["fill_rate_by_due"] = df["qty_ready_by_due"] / df["order_quantity"].replace(0, math.nan)
+    df["fill_rate_by_due"] = df["fill_rate_by_due"].fillna(0.0).clip(lower=0.0, upper=1.0)
+
+    if "tardiness_minutes" in df.columns:
+        df["tardiness_minutes"] = pd.to_numeric(df["tardiness_minutes"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    elif {"completion_time", "promised_date"}.issubset(df.columns):
+        df["tardiness_minutes"] = (
+            (df["completion_time"] - df["promised_date"]).dt.total_seconds() / 60.0
+        ).fillna(0.0).clip(lower=0.0)
+    else:
+        df["tardiness_minutes"] = 0.0
+
+    if "on_time" in df.columns:
+        df["on_time"] = _bool_series(df["on_time"])
+    elif {"completion_time", "promised_date"}.issubset(df.columns):
+        df["on_time"] = df["completion_time"].notna() & df["promised_date"].notna() & (df["completion_time"] <= df["promised_date"])
+    else:
+        df["on_time"] = df["tardiness_minutes"] <= 1e-9
+
+    if "in_full" in df.columns:
+        df["in_full"] = _bool_series(df["in_full"])
+    else:
+        df["in_full"] = df["fill_rate_by_due"] >= 0.999
+
+    if "otif" in df.columns:
+        df["otif"] = _bool_series(df["otif"])
+    else:
+        df["otif"] = df["on_time"] & df["in_full"]
+
+    if "order_type" not in df.columns:
+        df["order_type"] = "MTO"
+    if "priority_weight" not in df.columns:
+        df["priority_weight"] = 1.0
+    df["priority_weight"] = pd.to_numeric(df["priority_weight"], errors="coerce").fillna(1.0)
+    df["lateness_hours"] = df["tardiness_minutes"] / 60.0
+    df["failure_reason"] = [
+        _failure_reason(bool(on_time), bool(in_full), bool(otif))
+        for on_time, in_full, otif in zip(df["on_time"], df["in_full"], df["otif"])
+    ]
+
+    out = df.reindex(columns=columns).copy()
+    out = out.sort_values(["otif", "lateness_hours", "fill_rate_by_due"], ascending=[True, False, True])
+    return out.reset_index(drop=True)
+
+
+def _failure_reason(on_time: bool, in_full: bool, otif: bool) -> str:
+    if otif:
+        return "OK"
+    if not on_time and not in_full:
+        return "Late and not in-full"
+    if not on_time:
+        return "Late / on-time failed"
+    if not in_full:
+        return "Not in-full / quantity gap"
+    return "OTIF failed by source KPI"
+
+
 def _finalize_bundle(
     order_summary: pd.DataFrame,
     recommendations: list[dict[str, Any]],
@@ -706,7 +831,13 @@ def _finalize_bundle(
     rec_df = _sort_by_severity(rec_df)
     root_df = _sort_by_severity(root_df)
     summary = _build_summary(order_summary, kpis, bottleneck, rec_df)
-    return RecommendationBundle(summary=summary, recommendations=rec_df, root_causes=root_df)
+    otif_breakdown = _build_otif_breakdown(order_summary)
+    return RecommendationBundle(
+        summary=summary,
+        recommendations=rec_df,
+        root_causes=root_df,
+        otif_breakdown=otif_breakdown,
+    )
 
 
 def _sort_by_severity(df: pd.DataFrame) -> pd.DataFrame:

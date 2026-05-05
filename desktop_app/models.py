@@ -47,6 +47,7 @@ class AppRun:
     recommendation_summary: str = ""
     recommendations: pd.DataFrame = field(default_factory=pd.DataFrame)
     root_causes: pd.DataFrame = field(default_factory=pd.DataFrame)
+    otif_breakdown: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass

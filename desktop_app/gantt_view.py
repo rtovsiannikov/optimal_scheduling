@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Dict, Optional
+from typing import Dict, Iterable, Optional
 
 import pandas as pd
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
@@ -10,6 +10,8 @@ from matplotlib.backends.backend_qtagg import NavigationToolbar2QT as Navigation
 from matplotlib.colors import to_hex
 from matplotlib.dates import DateFormatter, date2num
 from matplotlib.figure import Figure
+from matplotlib.lines import Line2D
+from matplotlib.patches import Patch
 from PySide6.QtWidgets import QSizePolicy, QVBoxLayout, QWidget
 
 
@@ -29,8 +31,7 @@ class GanttView(QWidget):
         layout.addWidget(self.toolbar)
         layout.addWidget(self.canvas, stretch=1)
 
-        # Do not force a huge widget height: the chart must fit inside
-        # the tab area on laptops and projectors.
+        # Keep the chart readable while still allowing scrolling inside the tab.
         self.setMinimumSize(1180, 500)
         self.plot_empty("No schedule yet")
 
@@ -51,6 +52,9 @@ class GanttView(QWidget):
         replan_time=None,
         previous_schedule_df: Optional[pd.DataFrame] = None,
         color_map: Optional[Dict[str, str]] = None,
+        late_order_ids: Optional[Iterable[str]] = None,
+        partial_order_ids: Optional[Iterable[str]] = None,
+        highlight_order_id: Optional[str] = None,
     ) -> None:
         if schedule_df is None or schedule_df.empty:
             self.plot_empty("No feasible schedule to show")
@@ -60,10 +64,18 @@ class GanttView(QWidget):
         schedule["start_time"] = pd.to_datetime(schedule["start_time"])
         schedule["end_time"] = pd.to_datetime(schedule["end_time"])
         schedule["machine_id"] = schedule["machine_id"].astype(str)
+        if "order_id" in schedule.columns:
+            schedule["order_id"] = schedule["order_id"].astype(str)
+        if "operation_id" in schedule.columns:
+            schedule["operation_id"] = schedule["operation_id"].astype(str)
         schedule = schedule.sort_values(["machine_id", "start_time", "end_time"])
 
         machines = list(schedule["machine_id"].dropna().unique())
         changed_ops = self._find_changed_operations(schedule, previous_schedule_df)
+        late_orders = {str(x) for x in late_order_ids or []}
+        partial_orders = {str(x) for x in partial_order_ids or []}
+        highlighted = str(highlight_order_id) if highlight_order_id else None
+        final_operation_ids = self._final_operation_ids(schedule)
 
         self.figure.clear()
         self.figure.set_size_inches(12.0, 4.8, forward=True)
@@ -72,10 +84,8 @@ class GanttView(QWidget):
         y_step = 10.0
         y_height = 6.2
         y_positions = {machine: i * y_step for i, machine in enumerate(machines)}
-
         order_ids = list(schedule["order_id"].astype(str).dropna().unique()) if "order_id" in schedule else []
         order_to_color = color_map or self.build_order_color_map(order_ids)
-
         label_threshold_minutes = self._label_threshold_minutes(len(schedule))
 
         for _, row in schedule.iterrows():
@@ -86,14 +96,33 @@ class GanttView(QWidget):
             order_id = str(row.get("order_id", ""))
             op_id = str(row.get("operation_id", ""))
             is_changed = op_id in changed_ops
+            is_late = order_id in late_orders
+            is_partial = order_id in partial_orders
+            is_highlighted = highlighted is not None and order_id == highlighted
+
+            edgecolor = "none"
+            linewidth = 0.0
+            if is_changed:
+                edgecolor = "black"
+                linewidth = 1.1
+            if is_late:
+                edgecolor = "red"
+                linewidth = 1.8
+            if is_partial and not is_late:
+                edgecolor = "orange"
+                linewidth = 1.4
+            if is_highlighted:
+                edgecolor = "gold"
+                linewidth = 3.0
 
             ax.broken_barh(
                 [(start, width)],
                 (y_positions[machine], y_height),
                 facecolors=order_to_color.get(order_id, "C0"),
-                edgecolors="black" if is_changed else "none",
-                linewidth=1.1 if is_changed else 0.0,
-                alpha=0.92,
+                edgecolors=edgecolor,
+                linewidth=linewidth,
+                alpha=0.96 if is_highlighted else 0.92,
+                zorder=4 if is_highlighted else 2,
             )
 
             duration_minutes = (row["end_time"] - row["start_time"]).total_seconds() / 60.0
@@ -110,7 +139,17 @@ class GanttView(QWidget):
                     fontsize=7,
                     color="white",
                     clip_on=True,
+                    zorder=5,
                 )
+
+            if is_late and final_operation_ids.get(order_id) == op_id:
+                marker_y = y_positions[machine] + y_height + 0.8
+                ax.scatter(end, marker_y, marker="v", s=52, color="red", edgecolors="black", linewidths=0.4, zorder=7)
+                ax.text(end, marker_y + 0.9, "OTIF fail", ha="right", va="bottom", fontsize=7, color="red", zorder=7)
+            elif is_partial and final_operation_ids.get(order_id) == op_id:
+                marker_y = y_positions[machine] + y_height + 0.8
+                ax.scatter(end, marker_y, marker="D", s=42, color="orange", edgecolors="black", linewidths=0.4, zorder=7)
+                ax.text(end, marker_y + 0.9, "partial", ha="right", va="bottom", fontsize=7, color="orange", zorder=7)
 
         self._draw_downtime_overlay(ax, y_positions, y_height, downtime_df, scenario_name)
 
@@ -120,6 +159,18 @@ class GanttView(QWidget):
             ax.axvline(replan_x, linestyle="--", linewidth=1.5)
             ymax = max(y_positions.values()) + y_height if y_positions else 1
             ax.text(replan_x, ymax + 2.7, "replan time", rotation=90, va="bottom", ha="right", fontsize=8)
+
+        legend_handles = []
+        if late_orders:
+            legend_handles.append(Line2D([0], [0], marker="v", color="w", label="OTIF failed order", markerfacecolor="red", markeredgecolor="black", markersize=7))
+        if partial_orders:
+            legend_handles.append(Line2D([0], [0], marker="D", color="w", label="Not in-full / partial", markerfacecolor="orange", markeredgecolor="black", markersize=6))
+        if changed_ops:
+            legend_handles.append(Patch(facecolor="white", edgecolor="black", label="Changed vs baseline"))
+        if highlighted:
+            legend_handles.append(Patch(facecolor="white", edgecolor="gold", linewidth=2.5, label=f"Selected order {highlighted}"))
+        if legend_handles:
+            ax.legend(handles=legend_handles, loc="upper right", fontsize=7, frameon=True)
 
         ax.set_title(title, fontsize=14, fontweight="bold", pad=7)
         ax.set_yticks([y_positions[m] + y_height / 2 for m in machines])
@@ -132,21 +183,16 @@ class GanttView(QWidget):
         ax.tick_params(axis="y", labelsize=10)
         ax.grid(True, axis="x", linestyle="--", alpha=0.22)
         ax.margins(x=0.01)
-        ax.set_ylim(-2.5, max(y_positions.values()) + y_height + 5 if machines else 10)
+        ax.set_ylim(-2.5, max(y_positions.values()) + y_height + 7 if machines else 10)
 
-        # Fixed margins avoid clipped axis labels in the Qt canvas.
         self.figure.subplots_adjust(left=0.13, right=0.985, top=0.88, bottom=0.24)
         self.figure.autofmt_xdate(rotation=25, ha="right")
         self.canvas.draw_idle()
 
     @staticmethod
     def build_order_color_map(order_ids) -> Dict[str, str]:
-        """Build a deterministic color map for order IDs.
+        """Build a deterministic color map for order IDs."""
 
-        The same order_id gets the same color in baseline and rescheduled plots.
-        The colors are returned as hex values, so the same mapping can also be
-        shown in the Qt legend window.
-        """
         unique_order_ids = sorted({str(order_id) for order_id in order_ids if str(order_id) and str(order_id).lower() != "nan"})
         color_cycle = [to_hex(f"C{i % 10}") for i in range(max(1, len(unique_order_ids)))]
         return {order_id: color_cycle[i] for i, order_id in enumerate(unique_order_ids)}
@@ -162,11 +208,17 @@ class GanttView(QWidget):
         return 45.0
 
     @staticmethod
+    def _final_operation_ids(schedule: pd.DataFrame) -> dict[str, str]:
+        if schedule.empty or not {"order_id", "operation_id", "end_time"}.issubset(schedule.columns):
+            return {}
+        last_ops = schedule.sort_values("end_time").groupby("order_id", dropna=False).tail(1)
+        return dict(zip(last_ops["order_id"].astype(str), last_ops["operation_id"].astype(str)))
+
+    @staticmethod
     def _find_changed_operations(schedule: pd.DataFrame, previous_schedule_df: Optional[pd.DataFrame]) -> set[str]:
         changed_ops: set[str] = set()
         if previous_schedule_df is None or previous_schedule_df.empty:
             return changed_ops
-
         prev = previous_schedule_df.copy()
         prev["start_time"] = pd.to_datetime(prev["start_time"])
         prev = prev[["operation_id", "machine_id", "start_time"]].rename(
@@ -182,13 +234,11 @@ class GanttView(QWidget):
     def _draw_downtime_overlay(ax, y_positions, y_height, downtime_df, scenario_name) -> None:
         if downtime_df is None or downtime_df.empty or not scenario_name:
             return
-
         downtime = downtime_df.copy()
         if "scenario_name" in downtime.columns:
             downtime = downtime[downtime["scenario_name"].astype(str) == str(scenario_name)]
         if downtime.empty:
             return
-
         downtime["event_start"] = pd.to_datetime(downtime["event_start"])
         for _, row in downtime.iterrows():
             machine = str(row.get("machine_id", ""))
@@ -204,6 +254,7 @@ class GanttView(QWidget):
                 facecolors="red",
                 edgecolors="red",
                 alpha=0.22,
+                zorder=1,
             )
             ax.text(
                 start + width / 2,

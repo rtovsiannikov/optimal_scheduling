@@ -140,6 +140,10 @@ class MainWindow(QMainWindow):
         self.progress_elapsed_seconds = 0.0
         self.progress_limit_seconds = 1.0
         self.progress_busy_message = ""
+        self.active_recommendation_run = None
+        self.active_recommendation_target: Optional[str] = None
+        self.current_otif_breakdown = pd.DataFrame()
+        self.selected_order_id: Optional[str] = None
 
         self._build_actions()
         self._build_ui()
@@ -319,6 +323,7 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         self.kpi_panel = KpiPanel()
+        self.kpi_panel.card_clicked.connect(self._on_kpi_card_clicked)
         layout.addWidget(self.kpi_panel)
 
         self.tabs = QTabWidget()
@@ -331,11 +336,16 @@ class MainWindow(QMainWindow):
         self.machines_table = DataFrameTable()
         self.change_table = DataFrameTable()
         self.recommendations_table = DataFrameTable()
+        self.recommendations_table.set_word_wrap(True)
         self.root_causes_table = DataFrameTable()
+        self.root_causes_table.set_word_wrap(True)
+        self.otif_breakdown_table = DataFrameTable()
+        self.otif_breakdown_table.row_selected.connect(self._on_otif_order_selected)
         self.diagnostics_table = DataFrameTable()
         self.recommendation_summary = QTextEdit()
         self.recommendation_summary.setReadOnly(True)
-        self.recommendation_summary.setMinimumHeight(90)
+        self.recommendation_summary.setMinimumHeight(100)
+        self.recommendation_summary.setMaximumHeight(150)
         self.recommendation_summary.setStyleSheet(
             "QTextEdit { background: #ffffff; color: #111827; border: 1px solid #d9e0ea; border-radius: 10px; font-family: Arial; }"
         )
@@ -387,18 +397,71 @@ class MainWindow(QMainWindow):
 
     def _build_recommendations_tab(self) -> QWidget:
         widget = QWidget()
-        layout = QGridLayout(widget)
+        layout = QVBoxLayout(widget)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setVerticalSpacing(8)
-        layout.addWidget(QLabel("Executive summary"), 0, 0)
-        layout.addWidget(self.recommendation_summary, 1, 0)
-        layout.addWidget(QLabel("Recommended actions"), 2, 0)
-        layout.addWidget(self.recommendations_table, 3, 0)
-        layout.addWidget(QLabel("Root causes"), 4, 0)
-        layout.addWidget(self.root_causes_table, 5, 0)
-        layout.setRowStretch(1, 0)
-        layout.setRowStretch(3, 2)
-        layout.setRowStretch(5, 1)
+        layout.setSpacing(6)
+
+        self.recommendation_tabs = QTabWidget()
+        self.recommendation_tabs.setUsesScrollButtons(True)
+        self.recommendation_tabs.setDocumentMode(True)
+
+        self.recommendation_summary_tab = QWidget()
+        summary_layout = QVBoxLayout(self.recommendation_summary_tab)
+        summary_layout.setContentsMargins(0, 0, 0, 0)
+        summary_layout.addWidget(QLabel("Executive summary"))
+        summary_layout.addWidget(self.recommendation_summary)
+        hint = QLabel("Use the Actions, Root causes, and OTIF breakdown tabs to drill into the recommendation evidence.")
+        hint.setStyleSheet("color: #5a6472; padding: 4px;")
+        summary_layout.addWidget(hint)
+        summary_layout.addStretch(1)
+
+        self.recommendation_actions_tab = QWidget()
+        actions_layout = QVBoxLayout(self.recommendation_actions_tab)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.addWidget(QLabel("Recommended actions"))
+        actions_layout.addWidget(self.recommendations_table, stretch=1)
+
+        self.recommendation_root_causes_tab = QWidget()
+        root_layout = QVBoxLayout(self.recommendation_root_causes_tab)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.addWidget(QLabel("Root causes"))
+        root_layout.addWidget(self.root_causes_table, stretch=1)
+
+        self.recommendation_otif_tab = self._build_otif_breakdown_tab()
+
+        self.recommendation_tabs.addTab(self.recommendation_summary_tab, "Summary")
+        self.recommendation_tabs.addTab(self.recommendation_actions_tab, "Actions")
+        self.recommendation_tabs.addTab(self.recommendation_root_causes_tab, "Root causes")
+        self.recommendation_tabs.addTab(self.recommendation_otif_tab, "OTIF breakdown")
+        layout.addWidget(self.recommendation_tabs, stretch=1)
+        return widget
+
+    def _build_otif_breakdown_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        buttons = QHBoxLayout()
+        self.otif_all_button = QPushButton("Show all orders")
+        self.otif_failures_button = QPushButton("Show OTIF failures")
+        self.otif_late_button = QPushButton("Show on-time failures")
+        self.otif_infull_button = QPushButton("Show in-full failures")
+        for button in [self.otif_all_button, self.otif_failures_button, self.otif_late_button, self.otif_infull_button]:
+            button.setObjectName("SecondaryButton")
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        self.otif_all_button.clicked.connect(lambda: self._apply_otif_filter("all", select_tab=True))
+        self.otif_failures_button.clicked.connect(lambda: self._apply_otif_filter("failures", select_tab=True))
+        self.otif_late_button.clicked.connect(lambda: self._apply_otif_filter("late", select_tab=True))
+        self.otif_infull_button.clicked.connect(lambda: self._apply_otif_filter("in_full", select_tab=True))
+
+        hint = QLabel("Click an order row to highlight the same order on the Gantt chart. OTIF = on-time AND in-full.")
+        hint.setStyleSheet("color: #5a6472; padding: 2px;")
+
+        layout.addLayout(buttons)
+        layout.addWidget(hint)
+        layout.addWidget(self.otif_breakdown_table, stretch=1)
         return widget
 
     def _build_diagnostics_tab(self) -> QWidget:
@@ -464,6 +527,8 @@ class MainWindow(QMainWindow):
         self.recommendation_summary.setPlainText("Solve a baseline plan to generate OTIF-C diagnostics and recovery recommendations.")
         self.recommendations_table.set_dataframe(pd.DataFrame())
         self.root_causes_table.set_dataframe(pd.DataFrame())
+        self.current_otif_breakdown = pd.DataFrame()
+        self.otif_breakdown_table.set_dataframe(pd.DataFrame())
         self.diagnostics_table.set_dataframe(pd.DataFrame())
         self.baseline_gantt.plot_empty("Baseline schedule has not been solved yet")
         self.replanned_gantt.plot_empty("Reschedule has not been solved yet")
@@ -681,10 +746,20 @@ class MainWindow(QMainWindow):
         self.compare_table.set_dataframe(build_kpi_comparison(run.kpis, None))
         self.change_table.set_dataframe(build_change_table(None, None))
         self.diagnostics_table.set_dataframe(pd.DataFrame([run.validation]))
-        self._show_recommendations(run)
-        self.baseline_gantt.plot_schedule(run.schedule, title="Baseline production schedule", color_map=self._build_shared_order_color_map())
+        self._show_recommendations(run, target="baseline")
+        late_orders, partial_orders = self._failure_order_sets(run)
+        self.baseline_gantt.plot_schedule(
+            run.schedule,
+            title="Baseline production schedule",
+            color_map=self._build_shared_order_color_map(),
+            late_order_ids=late_orders,
+            partial_order_ids=partial_orders,
+            highlight_order_id=self.selected_order_id,
+        )
         self.replanned_gantt.plot_empty("Run rescheduling to show the repaired plan")
         self.tabs.setCurrentWidget(self.recommendations_tab if self._has_missed_otif(run) else self.baseline_tab)
+        if self._has_missed_otif(run):
+            self.recommendation_tabs.setCurrentWidget(self.recommendation_otif_tab)
 
     @Slot(object)
     def _on_reschedule_done(self, run) -> None:
@@ -704,7 +779,8 @@ class MainWindow(QMainWindow):
         self.compare_table.set_dataframe(build_kpi_comparison(self.state.baseline.kpis if self.state.baseline else None, run.kpis))
         self.change_table.set_dataframe(build_change_table(baseline_schedule, run.schedule))
         self.diagnostics_table.set_dataframe(pd.DataFrame([run.validation]))
-        self._show_recommendations(run)
+        self._show_recommendations(run, target="replanned")
+        late_orders, partial_orders = self._failure_order_sets(run)
         self.replanned_gantt.plot_schedule(
             run.schedule,
             title=f"Rescheduled production plan: {scenario_name}",
@@ -712,13 +788,121 @@ class MainWindow(QMainWindow):
             scenario_name=scenario_name,
             replan_time=replan_time,
             previous_schedule_df=baseline_schedule,
+            color_map=self._build_shared_order_color_map(),
+            late_order_ids=late_orders,
+            partial_order_ids=partial_orders,
+            highlight_order_id=self.selected_order_id,
         )
         self.tabs.setCurrentWidget(self.recommendations_tab if self._has_missed_otif(run) else self.replanned_tab)
+        if self._has_missed_otif(run):
+            self.recommendation_tabs.setCurrentWidget(self.recommendation_otif_tab)
 
-    def _show_recommendations(self, run) -> None:
+    def _show_recommendations(self, run, target: str) -> None:
+        self.active_recommendation_run = run
+        self.active_recommendation_target = target
+        self.selected_order_id = None
         self.recommendation_summary.setPlainText(run.recommendation_summary or "No recommendation summary available.")
         self.recommendations_table.set_dataframe(run.recommendations)
         self.root_causes_table.set_dataframe(run.root_causes)
+        self.current_otif_breakdown = run.otif_breakdown.copy() if run.otif_breakdown is not None else pd.DataFrame()
+        self._apply_otif_filter("failures" if self._has_missed_otif(run) else "all", select_tab=False)
+
+    def _apply_otif_filter(self, mode: str, *, select_tab: bool = True) -> None:
+        data = self.current_otif_breakdown.copy()
+        if data.empty:
+            self.otif_breakdown_table.set_dataframe(pd.DataFrame())
+        else:
+            if mode == "failures" and "otif" in data.columns:
+                data = data[~self._bool_series(data["otif"])]
+            elif mode == "late" and "on_time" in data.columns:
+                data = data[~self._bool_series(data["on_time"])]
+            elif mode == "in_full" and "in_full" in data.columns:
+                data = data[~self._bool_series(data["in_full"])]
+            elif mode == "mto_failures":
+                if "order_type" in data.columns:
+                    data = data[data["order_type"].astype(str).str.upper().eq("MTO")]
+                if "otif" in data.columns:
+                    data = data[~self._bool_series(data["otif"])]
+            self.otif_breakdown_table.set_dataframe(data.reset_index(drop=True))
+        if select_tab:
+            self.tabs.setCurrentWidget(self.recommendations_tab)
+            self.recommendation_tabs.setCurrentWidget(self.recommendation_otif_tab)
+
+    @Slot(str)
+    def _on_kpi_card_clicked(self, key: str) -> None:
+        if key == "otif_rate":
+            self._apply_otif_filter("failures", select_tab=True)
+        elif key == "mto_otif_rate":
+            self._apply_otif_filter("mto_failures", select_tab=True)
+        elif key in {"late_orders", "total_tardiness_minutes"}:
+            self._apply_otif_filter("late", select_tab=True)
+        elif key == "changed_operations_vs_previous":
+            self.tabs.setCurrentWidget(self.compare_tab)
+
+    @Slot(dict)
+    def _on_otif_order_selected(self, record: dict) -> None:
+        order_id = str(record.get("order_id", "")).strip()
+        if not order_id:
+            return
+        self.selected_order_id = order_id
+        self.statusBar().showMessage(f"Selected order {order_id}; highlighted on the Gantt chart.")
+        self._refresh_gantt_highlight()
+
+    def _refresh_gantt_highlight(self) -> None:
+        run = self.active_recommendation_run
+        target = self.active_recommendation_target
+        if run is None or target is None:
+            return
+        late_orders, partial_orders = self._failure_order_sets(run)
+        color_map = self._build_shared_order_color_map()
+        if target == "baseline":
+            self.baseline_gantt.plot_schedule(
+                run.schedule,
+                title="Baseline production schedule",
+                color_map=color_map,
+                late_order_ids=late_orders,
+                partial_order_ids=partial_orders,
+                highlight_order_id=self.selected_order_id,
+            )
+            return
+
+        assert self.state.bundle is not None
+        scenario_name = str(run.metadata.get("scenario_name", self.scenario_combo.currentText()))
+        replan_time = run.metadata.get("replan_time")
+        baseline_schedule = self.state.baseline.schedule if self.state.baseline else None
+        self.replanned_gantt.plot_schedule(
+            run.schedule,
+            title=f"Rescheduled production plan: {scenario_name}",
+            downtime_df=self.state.bundle.downtime_events,
+            scenario_name=scenario_name,
+            replan_time=replan_time,
+            previous_schedule_df=baseline_schedule,
+            color_map=color_map,
+            late_order_ids=late_orders,
+            partial_order_ids=partial_orders,
+            highlight_order_id=self.selected_order_id,
+        )
+
+    @staticmethod
+    def _bool_series(series: pd.Series) -> pd.Series:
+        if pd.api.types.is_bool_dtype(series):
+            return series.fillna(False)
+        return series.astype(str).str.strip().str.lower().map(
+            {"true": True, "1": True, "yes": True, "y": True, "false": False, "0": False, "no": False, "n": False}
+        ).fillna(False)
+
+    @staticmethod
+    def _failure_order_sets(run) -> tuple[set[str], set[str]]:
+        breakdown = run.otif_breakdown.copy() if getattr(run, "otif_breakdown", None) is not None else pd.DataFrame()
+        if breakdown.empty or "order_id" not in breakdown.columns:
+            return set(), set()
+        late_orders: set[str] = set()
+        partial_orders: set[str] = set()
+        if "otif" in breakdown.columns:
+            late_orders = set(breakdown.loc[~MainWindow._bool_series(breakdown["otif"]), "order_id"].astype(str))
+        if "in_full" in breakdown.columns:
+            partial_orders = set(breakdown.loc[~MainWindow._bool_series(breakdown["in_full"]), "order_id"].astype(str))
+        return late_orders, partial_orders
 
     @staticmethod
     def _has_missed_otif(run) -> bool:

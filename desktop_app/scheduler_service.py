@@ -170,6 +170,7 @@ class SchedulerService:
             recommendation_summary=recommendation_bundle.summary,
             recommendations=recommendation_bundle.recommendations,
             root_causes=recommendation_bundle.root_causes,
+            otif_breakdown=recommendation_bundle.otif_breakdown,
         )
 
     @staticmethod
@@ -182,6 +183,7 @@ class SchedulerService:
         pd.DataFrame([run.validation]).to_csv(output_dir / f"{prefix}_validation.csv", index=False)
         run.recommendations.to_csv(output_dir / f"{prefix}_recommendations.csv", index=False)
         run.root_causes.to_csv(output_dir / f"{prefix}_root_causes.csv", index=False)
+        run.otif_breakdown.to_csv(output_dir / f"{prefix}_otif_breakdown.csv", index=False)
         (output_dir / f"{prefix}_recommendation_summary.txt").write_text(
             run.recommendation_summary or "",
             encoding="utf-8",
