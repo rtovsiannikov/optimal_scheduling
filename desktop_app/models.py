@@ -44,6 +44,9 @@ class AppRun:
     kpis: Dict[str, float]
     validation: Dict[str, float]
     metadata: Dict[str, Any]
+    recommendation_summary: str = ""
+    recommendations: pd.DataFrame = field(default_factory=pd.DataFrame)
+    root_causes: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass

@@ -330,16 +330,31 @@ class MainWindow(QMainWindow):
         self.orders_table = DataFrameTable()
         self.machines_table = DataFrameTable()
         self.change_table = DataFrameTable()
+        self.recommendations_table = DataFrameTable()
+        self.root_causes_table = DataFrameTable()
         self.diagnostics_table = DataFrameTable()
+        self.recommendation_summary = QTextEdit()
+        self.recommendation_summary.setReadOnly(True)
+        self.recommendation_summary.setMinimumHeight(90)
+        self.recommendation_summary.setStyleSheet(
+            "QTextEdit { background: #ffffff; color: #111827; border: 1px solid #d9e0ea; border-radius: 10px; font-family: Arial; }"
+        )
         self.solver_log = QTextEdit()
         self.solver_log.setReadOnly(True)
 
-        self.tabs.addTab(self._wrap_scrollable(self.baseline_gantt), "Baseline Plan")
-        self.tabs.addTab(self._wrap_scrollable(self.replanned_gantt), "Rescheduled Plan")
-        self.tabs.addTab(self._build_compare_tab(), "Compare")
+        self.baseline_tab = self._wrap_scrollable(self.baseline_gantt)
+        self.replanned_tab = self._wrap_scrollable(self.replanned_gantt)
+        self.compare_tab = self._build_compare_tab()
+        self.recommendations_tab = self._build_recommendations_tab()
+        self.diagnostics_tab = self._build_diagnostics_tab()
+
+        self.tabs.addTab(self.baseline_tab, "Baseline Plan")
+        self.tabs.addTab(self.replanned_tab, "Rescheduled Plan")
+        self.tabs.addTab(self.compare_tab, "Compare")
+        self.tabs.addTab(self.recommendations_tab, "Recommendations")
         self.tabs.addTab(self.orders_table, "Orders")
         self.tabs.addTab(self.machines_table, "Machines")
-        self.tabs.addTab(self._build_diagnostics_tab(), "Diagnostics")
+        self.tabs.addTab(self.diagnostics_tab, "Diagnostics")
         layout.addWidget(self.tabs, stretch=1)
         return area
 
@@ -368,6 +383,22 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.change_table, 3, 0)
         layout.setRowStretch(1, 1)
         layout.setRowStretch(3, 1)
+        return widget
+
+    def _build_recommendations_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QGridLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setVerticalSpacing(8)
+        layout.addWidget(QLabel("Executive summary"), 0, 0)
+        layout.addWidget(self.recommendation_summary, 1, 0)
+        layout.addWidget(QLabel("Recommended actions"), 2, 0)
+        layout.addWidget(self.recommendations_table, 3, 0)
+        layout.addWidget(QLabel("Root causes"), 4, 0)
+        layout.addWidget(self.root_causes_table, 5, 0)
+        layout.setRowStretch(1, 0)
+        layout.setRowStretch(3, 2)
+        layout.setRowStretch(5, 1)
         return widget
 
     def _build_diagnostics_tab(self) -> QWidget:
@@ -430,6 +461,9 @@ class MainWindow(QMainWindow):
         self.machines_table.set_dataframe(bundle.machines)
         self.compare_table.set_dataframe(build_kpi_comparison(None, None))
         self.change_table.set_dataframe(build_change_table(None, None))
+        self.recommendation_summary.setPlainText("Solve a baseline plan to generate OTIF-C diagnostics and recovery recommendations.")
+        self.recommendations_table.set_dataframe(pd.DataFrame())
+        self.root_causes_table.set_dataframe(pd.DataFrame())
         self.diagnostics_table.set_dataframe(pd.DataFrame())
         self.baseline_gantt.plot_empty("Baseline schedule has not been solved yet")
         self.replanned_gantt.plot_empty("Reschedule has not been solved yet")
@@ -647,9 +681,10 @@ class MainWindow(QMainWindow):
         self.compare_table.set_dataframe(build_kpi_comparison(run.kpis, None))
         self.change_table.set_dataframe(build_change_table(None, None))
         self.diagnostics_table.set_dataframe(pd.DataFrame([run.validation]))
+        self._show_recommendations(run)
         self.baseline_gantt.plot_schedule(run.schedule, title="Baseline production schedule", color_map=self._build_shared_order_color_map())
         self.replanned_gantt.plot_empty("Run rescheduling to show the repaired plan")
-        self.tabs.setCurrentWidget(self.baseline_gantt)
+        self.tabs.setCurrentWidget(self.recommendations_tab if self._has_missed_otif(run) else self.baseline_tab)
 
     @Slot(object)
     def _on_reschedule_done(self, run) -> None:
@@ -669,6 +704,7 @@ class MainWindow(QMainWindow):
         self.compare_table.set_dataframe(build_kpi_comparison(self.state.baseline.kpis if self.state.baseline else None, run.kpis))
         self.change_table.set_dataframe(build_change_table(baseline_schedule, run.schedule))
         self.diagnostics_table.set_dataframe(pd.DataFrame([run.validation]))
+        self._show_recommendations(run)
         self.replanned_gantt.plot_schedule(
             run.schedule,
             title=f"Rescheduled production plan: {scenario_name}",
@@ -677,7 +713,19 @@ class MainWindow(QMainWindow):
             replan_time=replan_time,
             previous_schedule_df=baseline_schedule,
         )
-        self.tabs.setCurrentWidget(self.replanned_gantt)
+        self.tabs.setCurrentWidget(self.recommendations_tab if self._has_missed_otif(run) else self.replanned_tab)
+
+    def _show_recommendations(self, run) -> None:
+        self.recommendation_summary.setPlainText(run.recommendation_summary or "No recommendation summary available.")
+        self.recommendations_table.set_dataframe(run.recommendations)
+        self.root_causes_table.set_dataframe(run.root_causes)
+
+    @staticmethod
+    def _has_missed_otif(run) -> bool:
+        try:
+            return float(run.kpis.get("missed_otif_orders", 0.0)) > 0.0
+        except Exception:
+            return False
 
     def append_log(self, text: str) -> None:
         self.solver_log.append(text.rstrip())

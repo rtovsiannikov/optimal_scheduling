@@ -14,6 +14,7 @@ from typing import Optional
 import pandas as pd
 
 from .models import AppRun, SolverSettings
+from .recommendation_engine import generate_recommendations
 
 
 REQUIRED_BUNDLE_FILES = {
@@ -144,6 +145,19 @@ class SchedulerService:
             use_actual_downtime=use_actual_downtime,
             replan_time=replan_time,
         )
+        recommendation_bundle = generate_recommendations(
+            schedule_df=result.schedule,
+            order_summary_df=result.order_summary,
+            machines_df=bundle.machines,
+            orders_df=bundle.orders,
+            operations_df=bundle.operations,
+            shifts_df=bundle.shifts,
+            downtime_events_df=bundle.downtime_events,
+            previous_schedule_df=previous_schedule_df,
+            kpis=kpis,
+            scenario_name=scenario_name,
+            replan_time=replan_time,
+        )
         return AppRun(
             status=result.status,
             objective_value=result.objective_value,
@@ -153,6 +167,9 @@ class SchedulerService:
             kpis=kpis,
             validation=validation,
             metadata=result.metadata,
+            recommendation_summary=recommendation_bundle.summary,
+            recommendations=recommendation_bundle.recommendations,
+            root_causes=recommendation_bundle.root_causes,
         )
 
     @staticmethod
@@ -163,3 +180,9 @@ class SchedulerService:
         run.order_summary.to_csv(output_dir / f"{prefix}_orders.csv", index=False)
         pd.DataFrame([run.kpis]).to_csv(output_dir / f"{prefix}_kpis.csv", index=False)
         pd.DataFrame([run.validation]).to_csv(output_dir / f"{prefix}_validation.csv", index=False)
+        run.recommendations.to_csv(output_dir / f"{prefix}_recommendations.csv", index=False)
+        run.root_causes.to_csv(output_dir / f"{prefix}_root_causes.csv", index=False)
+        (output_dir / f"{prefix}_recommendation_summary.txt").write_text(
+            run.recommendation_summary or "",
+            encoding="utf-8",
+        )
