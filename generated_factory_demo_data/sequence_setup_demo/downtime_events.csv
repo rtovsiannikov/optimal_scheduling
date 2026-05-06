@@ -1,0 +1,4 @@
+scenario_name,event_type,machine_id,event_start,estimated_duration_minutes,actual_duration_minutes,description
+baseline_no_disruption,none,,,0,0,Baseline plan without disruption.
+paint_line_stop_60m,machine_downtime,M_PAINT_01,2026-05-04 22:00:00,60,90,Unexpected paint line stop; useful for rescheduling demo.
+weld_line_stop_45m,machine_downtime,M_WELD_02,2026-05-05 02:00:00,45,75,Welding cell downtime scenario.

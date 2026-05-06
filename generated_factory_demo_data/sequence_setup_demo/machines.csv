@@ -1,0 +1,10 @@
+machine_id,machine_group,machine_name,initial_product_family,initial_color,initial_material_type,initial_tooling_type,initial_setup_state
+M_CUT_01,CUT,CUT line 1,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
+M_CUT_02,CUT,CUT line 2,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
+M_WELD_01,WELD,WELD line 1,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
+M_WELD_02,WELD,WELD line 2,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
+M_PAINT_01,PAINT,PAINT line 1,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
+M_PAINT_02,PAINT,PAINT line 2,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
+M_ASSY_01,ASSY,ASSY line 1,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
+M_ASSY_02,ASSY,ASSY line 2,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
+M_PACK_01,PACK,PACK line 1,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
