@@ -491,7 +491,6 @@ class GanttView(QWidget):
     ):
         handles = [
             Patch(facecolor="#2563eb", edgecolor="#ffffff", label="Operation block / order color"),
-            Patch(facecolor="#e2e8f0", edgecolor="#64748b", hatch="///", label="Setup block"),
         ]
         if downtime_drawn:
             handles.append(Patch(facecolor="#ef4444", alpha=0.20, edgecolor="#b91c1c", label="Downtime window"))
