@@ -68,14 +68,18 @@ class GanttView(QWidget):
             schedule["order_id"] = schedule["order_id"].astype(str)
         if "operation_id" in schedule.columns:
             schedule["operation_id"] = schedule["operation_id"].astype(str)
+        if "record_type" not in schedule.columns:
+            schedule["record_type"] = "operation"
+        schedule["record_type"] = schedule["record_type"].fillna("operation").astype(str).str.lower()
         schedule = schedule.sort_values(["machine_id", "start_time", "end_time"])
+        operation_schedule = schedule[schedule["record_type"].ne("setup")].copy()
 
         machines = list(schedule["machine_id"].dropna().unique())
-        changed_ops = self._find_changed_operations(schedule, previous_schedule_df)
+        changed_ops = self._find_changed_operations(operation_schedule, previous_schedule_df)
         late_orders = {str(x) for x in late_order_ids or []}
         partial_orders = {str(x) for x in partial_order_ids or []}
         highlighted = str(highlight_order_id) if highlight_order_id else None
-        final_operation_ids = self._final_operation_ids(schedule)
+        final_operation_ids = self._final_operation_ids(operation_schedule)
 
         self.figure.clear()
         self.figure.set_size_inches(12.0, 4.8, forward=True)
@@ -84,7 +88,7 @@ class GanttView(QWidget):
         y_step = 10.0
         y_height = 6.2
         y_positions = {machine: i * y_step for i, machine in enumerate(machines)}
-        order_ids = list(schedule["order_id"].astype(str).dropna().unique()) if "order_id" in schedule else []
+        order_ids = list(operation_schedule["order_id"].astype(str).dropna().unique()) if "order_id" in operation_schedule else []
         order_to_color = color_map or self.build_order_color_map(order_ids)
         label_threshold_minutes = self._label_threshold_minutes(len(schedule))
 
@@ -95,6 +99,34 @@ class GanttView(QWidget):
             width = max(end - start, 1.0 / (24 * 60))
             order_id = str(row.get("order_id", ""))
             op_id = str(row.get("operation_id", ""))
+            record_type = str(row.get("record_type", "operation")).lower()
+
+            if record_type == "setup":
+                ax.broken_barh(
+                    [(start, width)],
+                    (y_positions[machine] + 0.45, y_height - 0.9),
+                    facecolors="#9ca3af",
+                    edgecolors="#4b5563",
+                    linewidth=0.8,
+                    hatch="///",
+                    alpha=0.62,
+                    zorder=3,
+                )
+                duration_minutes = (row["end_time"] - row["start_time"]).total_seconds() / 60.0
+                if duration_minutes >= max(20.0, label_threshold_minutes / 2.0):
+                    ax.text(
+                        start + width / 2,
+                        y_positions[machine] + y_height / 2,
+                        f"setup\n{int(round(duration_minutes))}m",
+                        ha="center",
+                        va="center",
+                        fontsize=6.5,
+                        color="#111827",
+                        clip_on=True,
+                        zorder=6,
+                    )
+                continue
+
             is_changed = op_id in changed_ops
             is_late = order_id in late_orders
             is_partial = order_id in partial_orders
@@ -169,6 +201,8 @@ class GanttView(QWidget):
             legend_handles.append(Patch(facecolor="white", edgecolor="black", label="Changed vs baseline"))
         if highlighted:
             legend_handles.append(Patch(facecolor="white", edgecolor="gold", linewidth=2.5, label=f"Selected order {highlighted}"))
+        if "record_type" in schedule.columns and schedule["record_type"].eq("setup").any():
+            legend_handles.append(Patch(facecolor="#9ca3af", edgecolor="#4b5563", hatch="///", label="Sequence setup"))
         if legend_handles:
             ax.legend(handles=legend_handles, loc="upper right", fontsize=7, frameon=True)
 
@@ -211,20 +245,32 @@ class GanttView(QWidget):
     def _final_operation_ids(schedule: pd.DataFrame) -> dict[str, str]:
         if schedule.empty or not {"order_id", "operation_id", "end_time"}.issubset(schedule.columns):
             return {}
+        if "record_type" in schedule.columns:
+            schedule = schedule[schedule["record_type"].fillna("operation").astype(str).str.lower().ne("setup")].copy()
+        if schedule.empty:
+            return {}
         last_ops = schedule.sort_values("end_time").groupby("order_id", dropna=False).tail(1)
         return dict(zip(last_ops["order_id"].astype(str), last_ops["operation_id"].astype(str)))
 
     @staticmethod
     def _find_changed_operations(schedule: pd.DataFrame, previous_schedule_df: Optional[pd.DataFrame]) -> set[str]:
         changed_ops: set[str] = set()
-        if previous_schedule_df is None or previous_schedule_df.empty:
+        if previous_schedule_df is None or previous_schedule_df.empty or schedule.empty:
             return changed_ops
+        current = schedule.copy()
         prev = previous_schedule_df.copy()
+        if "record_type" in current.columns:
+            current = current[current["record_type"].fillna("operation").astype(str).str.lower().ne("setup")].copy()
+        if "record_type" in prev.columns:
+            prev = prev[prev["record_type"].fillna("operation").astype(str).str.lower().ne("setup")].copy()
+        if current.empty or prev.empty or not {"operation_id", "machine_id", "start_time"}.issubset(prev.columns):
+            return changed_ops
+        current["start_time"] = pd.to_datetime(current["start_time"])
         prev["start_time"] = pd.to_datetime(prev["start_time"])
         prev = prev[["operation_id", "machine_id", "start_time"]].rename(
             columns={"machine_id": "prev_machine_id", "start_time": "prev_start_time"}
         )
-        cmp = schedule.merge(prev, on="operation_id", how="inner")
+        cmp = current.merge(prev, on="operation_id", how="inner")
         if cmp.empty:
             return changed_ops
         shifted = (cmp["start_time"] != cmp["prev_start_time"]) | (cmp["machine_id"] != cmp["prev_machine_id"])
