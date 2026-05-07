@@ -490,6 +490,11 @@ def build_cp_sat_model(
     tardiness_weight: int = 100,
     makespan_weight: int = 1,
     preference_bonus: int = 5,
+    stability_change_penalty: int = 2_000,
+    stability_machine_change_penalty: int = 8_000,
+    stability_start_shift_penalty: int = 5,
+    stability_start_tolerance_minutes: int = 15,
+    max_changed_operations: Optional[int] = None,
 ) -> Tuple[cp_model.CpModel, Dict[str, object]]:
     """Build a CP-SAT model for the schedule.
 
@@ -501,7 +506,8 @@ def build_cp_sat_model(
     - routing precedence is enforced inside each order batch, not across all batches;
     - batches of the same order can flow through the route in parallel when machines are available;
     - downtime is modeled as fixed intervals on the affected machine;
-    - MTO OTIF is the primary objective, with partial fill by deadline as a secondary objective.
+    - MTO OTIF is the primary objective, with partial fill by deadline as a secondary objective;
+    - in rescheduling mode, schedule-stability penalties discourage unnecessary moves.
     """
     origin = _time_origin(bundle)
     model = cp_model.CpModel()
@@ -815,12 +821,86 @@ def build_cp_sat_model(
 
     preferred_reward = sum(op_machine_choice_terms) if op_machine_choice_terms else 0
 
+    stability_changed_terms = []
+    stability_machine_change_terms = []
+    stability_start_shift_terms = []
+
+    # Rolling rescheduling should not rebuild the remaining factory plan from scratch
+    # unless there is a real business reason to do so.  The terms below make the
+    # solver prefer plans that stay close to the previous/baseline schedule after
+    # the replan point.  Fixed operations are skipped because they are already
+    # constrained to stay exactly where they were.
+    if previous_schedule is not None and replan_time is not None:
+        prev_for_stability = previous_schedule.copy()
+        prev_for_stability["start_time"] = pd.to_datetime(prev_for_stability["start_time"])
+        prev_for_stability["end_time"] = pd.to_datetime(prev_for_stability["end_time"])
+        prev_for_stability["operation_id"] = prev_for_stability["operation_id"].astype(str)
+        prev_for_stability = prev_for_stability.drop_duplicates("operation_id", keep="last")
+
+        tolerance = max(0, int(stability_start_tolerance_minutes))
+
+        for _, prev_row in prev_for_stability.iterrows():
+            op_id = str(prev_row["operation_id"])
+
+            if op_id in fixed_assignments:
+                continue
+            if op_id not in op_start or op_id not in op_end:
+                continue
+
+            prev_machine_id = str(prev_row["machine_id"])
+            prev_start_minute = _to_minute(pd.to_datetime(prev_row["start_time"]), origin)
+
+            # 1) Penalize large start-time shifts.
+            start_shift_abs = model.NewIntVar(0, horizon, f"stability_start_shift_abs_{op_id}")
+            model.AddAbsEquality(start_shift_abs, op_start[op_id] - prev_start_minute)
+
+            start_shift_excess = model.NewIntVar(0, horizon, f"stability_start_shift_excess_{op_id}")
+            model.Add(start_shift_excess >= start_shift_abs - tolerance)
+            model.Add(start_shift_excess >= 0)
+            stability_start_shift_terms.append(start_shift_excess)
+
+            start_changed = model.NewBoolVar(f"stability_start_changed_{op_id}")
+            model.Add(start_shift_abs <= tolerance).OnlyEnforceIf(start_changed.Not())
+            model.Add(start_shift_abs >= tolerance + 1).OnlyEnforceIf(start_changed)
+
+            # 2) Penalize moving an operation to another machine.
+            same_machine_choices = [
+                present_var
+                for key, present_var in op_present.items()
+                if key[0] == op_id and key[1] == prev_machine_id
+            ]
+
+            machine_changed = model.NewBoolVar(f"stability_machine_changed_{op_id}")
+            if same_machine_choices:
+                model.Add(machine_changed + sum(same_machine_choices) == 1)
+            else:
+                # The old machine is no longer a feasible alternative.
+                model.Add(machine_changed == 1)
+            stability_machine_change_terms.append(machine_changed)
+
+            # 3) Count an operation as changed if either start time or machine changed.
+            operation_changed = model.NewBoolVar(f"stability_operation_changed_{op_id}")
+            model.Add(operation_changed >= start_changed)
+            model.Add(operation_changed >= machine_changed)
+            model.Add(operation_changed <= start_changed + machine_changed)
+            stability_changed_terms.append(operation_changed)
+
+        if max_changed_operations is not None and stability_changed_terms:
+            model.Add(sum(stability_changed_terms) <= int(max_changed_operations))
+
+    stability_penalty = (
+        int(stability_change_penalty) * sum(stability_changed_terms)
+        + int(stability_machine_change_penalty) * sum(stability_machine_change_terms)
+        + int(stability_start_shift_penalty) * sum(stability_start_shift_terms)
+    )
+
     model.Minimize(
         missed_otif_penalty * sum(missed_otif_terms)
         + missed_quantity_penalty * sum(missed_quantity_terms)
         + tardiness_weight * sum(tardiness_terms)
         + makespan_weight * makespan
         - preference_bonus * preferred_reward
+        + stability_penalty
     )
 
     context = {
@@ -844,6 +924,9 @@ def build_cp_sat_model(
         "downtime_map": effective_downtime_map,
         "raw_downtime_map": downtime_map,
         "fixed_assignments": fixed_assignments,
+        "stability_changed_terms": stability_changed_terms,
+        "stability_machine_change_terms": stability_machine_change_terms,
+        "stability_start_shift_terms": stability_start_shift_terms,
         "priority_weights": priority_weights,
         "objective_weights": {
             "missed_otif_penalty": missed_otif_penalty,
@@ -851,6 +934,11 @@ def build_cp_sat_model(
             "tardiness_weight": tardiness_weight,
             "makespan_weight": makespan_weight,
             "preference_bonus": preference_bonus,
+            "stability_change_penalty": stability_change_penalty,
+            "stability_machine_change_penalty": stability_machine_change_penalty,
+            "stability_start_shift_penalty": stability_start_shift_penalty,
+            "stability_start_tolerance_minutes": stability_start_tolerance_minutes,
+            "max_changed_operations": max_changed_operations,
         },
     }
     return model, context
@@ -1040,6 +1128,11 @@ def solve_schedule(
     tardiness_weight: int = 100,
     makespan_weight: int = 1,
     preference_bonus: int = 5,
+    stability_change_penalty: int = 2_000,
+    stability_machine_change_penalty: int = 8_000,
+    stability_start_shift_penalty: int = 5,
+    stability_start_tolerance_minutes: int = 15,
+    max_changed_operations: Optional[int] = None,
 ) -> SolveResult:
     """Solve the full scheduling problem for one scenario."""
     bundle = load_data_bundle(bundle_dir)
@@ -1052,6 +1145,11 @@ def solve_schedule(
         tardiness_weight=tardiness_weight,
         makespan_weight=makespan_weight,
         preference_bonus=preference_bonus,
+        stability_change_penalty=stability_change_penalty,
+        stability_machine_change_penalty=stability_machine_change_penalty,
+        stability_start_shift_penalty=stability_start_shift_penalty,
+        stability_start_tolerance_minutes=stability_start_tolerance_minutes,
+        max_changed_operations=max_changed_operations,
     )
 
     solver = cp_model.CpSolver()
@@ -1116,6 +1214,11 @@ def run_reschedule_on_event(
     tardiness_weight: int = 100,
     makespan_weight: int = 1,
     preference_bonus: int = 5,
+    stability_change_penalty: int = 2_000,
+    stability_machine_change_penalty: int = 8_000,
+    stability_start_shift_penalty: int = 5,
+    stability_start_tolerance_minutes: int = 15,
+    max_changed_operations: Optional[int] = None,
 ) -> SolveResult:
     """Replan from an existing baseline schedule after a disruption event."""
     bundle = load_data_bundle(bundle_dir)
@@ -1140,6 +1243,11 @@ def run_reschedule_on_event(
         tardiness_weight=tardiness_weight,
         makespan_weight=makespan_weight,
         preference_bonus=preference_bonus,
+        stability_change_penalty=stability_change_penalty,
+        stability_machine_change_penalty=stability_machine_change_penalty,
+        stability_start_shift_penalty=stability_start_shift_penalty,
+        stability_start_tolerance_minutes=stability_start_tolerance_minutes,
+        max_changed_operations=max_changed_operations,
     )
 
     solver = cp_model.CpSolver()
