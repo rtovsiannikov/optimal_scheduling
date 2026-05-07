@@ -25,10 +25,6 @@ BUNDLE_CSVS = {
     "shifts": "shifts.csv",
     "downtime_events": "downtime_events.csv",
     "scenarios": "scenarios.csv",
-    # Optional sequence-dependent setup files. They are written when present and
-    # ignored by older fixed-setup bundles.
-    "setup_matrix": "setup_matrix.csv",
-    "initial_machine_states": "initial_machine_states.csv",
 }
 
 SOLVER_ACTIONS = {
@@ -155,14 +151,7 @@ def apply_recommendation_to_bundle(
             shifts=frames["shifts"],
             machine_group=group,
         )
-        if "initial_machine_states" in frames:
-            frames["initial_machine_states"] = add_initial_state_for_virtual_machine(
-                initial_states=frames["initial_machine_states"],
-                machines=frames["machines"],
-                machine_group=group,
-                new_machine_id=new_machine,
-            )
-        changed.update({"machines.csv", "shifts.csv", "initial_machine_states.csv"})
+        changed.update({"machines.csv", "shifts.csv"})
         description = f"Added a temporary qualified machine {new_machine} for group {group} and copied its shift calendar."
 
 
@@ -200,12 +189,6 @@ def write_bundle_frames(frames: Dict[str, pd.DataFrame], output_dir: Path) -> No
     output_dir.mkdir(parents=True, exist_ok=True)
     for key, filename in BUNDLE_CSVS.items():
         df = frames.get(key, pd.DataFrame())
-        # Do not create empty optional setup files for old fixed-setup bundles;
-        # an empty CSV without headers would break pd.read_csv on reload.
-        if key in {"setup_matrix", "initial_machine_states"} and (df is None or df.empty):
-            continue
-        if df is None:
-            df = pd.DataFrame()
         df.to_csv(output_dir / filename, index=False)
 
 
@@ -334,52 +317,6 @@ def boost_order_priority(orders: pd.DataFrame, order_id: str) -> pd.DataFrame:
     return out
 
 
-
-def add_initial_state_for_virtual_machine(
-    *,
-    initial_states: pd.DataFrame,
-    machines: pd.DataFrame,
-    machine_group: str,
-    new_machine_id: str,
-) -> pd.DataFrame:
-    """Copy an initial setup state for a newly added virtual machine.
-
-    Sequence-dependent setup uses initial_machine_states.csv to know the state of a
-    machine before its first scheduled operation. A what-if virtual machine should
-    inherit a realistic state from an existing machine in the same group.
-    """
-    if initial_states is None:
-        initial_states = pd.DataFrame()
-    out = initial_states.copy()
-    if "machine_id" not in out.columns:
-        out["machine_id"] = pd.Series(dtype=str)
-    if "initial_setup_state" not in out.columns:
-        out["initial_setup_state"] = "GENERIC|NA|NA|NA"
-
-    if not out.empty and str(new_machine_id) in set(out["machine_id"].astype(str)):
-        return out
-
-    state = "GENERIC|NA|NA|NA"
-    if machines is not None and not machines.empty and {"machine_id", "machine_group"}.issubset(machines.columns):
-        existing = machines[
-            machines["machine_group"].astype(str).eq(str(machine_group))
-            & ~machines["machine_id"].astype(str).eq(str(new_machine_id))
-        ]
-        if not existing.empty:
-            source_machine = str(existing.iloc[0]["machine_id"])
-            match = out[out["machine_id"].astype(str).eq(source_machine)]
-            if not match.empty:
-                state = str(match.iloc[0].get("initial_setup_state", state))
-            elif "initial_setup_state" in existing.columns:
-                candidate = existing.iloc[0].get("initial_setup_state")
-                if candidate is not None and not pd.isna(candidate):
-                    state = str(candidate)
-
-    return pd.concat(
-        [out, pd.DataFrame([{"machine_id": str(new_machine_id), "initial_setup_state": state}])],
-        ignore_index=True,
-    )
-
 def extend_all_machine_horizons(shifts: pd.DataFrame, minutes: int) -> pd.DataFrame:
     """Extend the last shift of each machine by a fixed amount."""
 
@@ -412,8 +349,6 @@ def _bundle_frames(bundle: Any) -> Dict[str, pd.DataFrame]:
         "shifts": getattr(bundle, "shifts", pd.DataFrame()).copy(),
         "downtime_events": getattr(bundle, "downtime_events", pd.DataFrame()).copy(),
         "scenarios": getattr(bundle, "scenarios", pd.DataFrame()).copy(),
-        "setup_matrix": getattr(bundle, "setup_matrix", pd.DataFrame()).copy(),
-        "initial_machine_states": getattr(bundle, "initial_machine_states", pd.DataFrame()).copy(),
     }
 
 

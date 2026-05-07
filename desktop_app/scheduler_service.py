@@ -78,7 +78,6 @@ class SchedulerService:
             tardiness_weight=settings.weights.tardiness_weight,
             makespan_weight=settings.weights.makespan_weight,
             preference_bonus=settings.weights.preference_bonus,
-            sequence_setup_weight=settings.weights.sequence_setup_weight,
         )
         bundle = self.load_bundle(bundle_dir)
         return self._enrich_run(
@@ -113,7 +112,6 @@ class SchedulerService:
             tardiness_weight=settings.weights.tardiness_weight,
             makespan_weight=settings.weights.makespan_weight,
             preference_bonus=settings.weights.preference_bonus,
-            sequence_setup_weight=settings.weights.sequence_setup_weight,
         )
         bundle = self.load_bundle(bundle_dir)
         actual_replan_time = result.metadata.get("replan_time") if result.metadata else None
@@ -181,7 +179,6 @@ class SchedulerService:
                     tardiness_weight=effective_settings.weights.tardiness_weight,
                     makespan_weight=effective_settings.weights.makespan_weight,
                     preference_bonus=effective_settings.weights.preference_bonus,
-                    sequence_setup_weight=effective_settings.weights.sequence_setup_weight,
                 )
                 actual_replan_time = result.metadata.get("replan_time") if result.metadata else replan_time
             else:
@@ -198,7 +195,6 @@ class SchedulerService:
                     tardiness_weight=effective_settings.weights.tardiness_weight,
                     makespan_weight=effective_settings.weights.makespan_weight,
                     preference_bonus=effective_settings.weights.preference_bonus,
-                    sequence_setup_weight=effective_settings.weights.sequence_setup_weight,
                 )
                 actual_replan_time = None
 

@@ -18,7 +18,6 @@ class ObjectiveWeights:
     tardiness_weight: int = 100
     makespan_weight: int = 1
     preference_bonus: int = 5
-    sequence_setup_weight: int = 2
 
 
 @dataclass
