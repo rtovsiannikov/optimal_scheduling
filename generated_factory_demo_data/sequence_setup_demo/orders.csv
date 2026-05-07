@@ -13,3 +13,9 @@ ORD_011,MTO,2,urgent,2026-05-04 14:00:00,2026-05-06 08:00:00,2026-05-06 08:00:00
 ORD_012,MTO,2,urgent,2026-05-04 08:00:00,2026-05-06 16:00:00,2026-05-06 16:00:00,8,KIT_D,black,plastic,tool_C,KIT_D|black|plastic|tool_C
 ORD_013,MTO,1,critical,2026-05-04 10:00:00,2026-05-06 20:00:00,2026-05-06 20:00:00,8,FRAME_B,red,aluminum,tool_B,FRAME_B|red|aluminum|tool_B
 ORD_014,MTO,3,high,2026-05-04 20:00:00,2026-05-06 16:00:00,2026-05-06 16:00:00,14,FRAME_B,blue,aluminum,tool_B,FRAME_B|blue|aluminum|tool_B
+ORD_015,MTO,5,low,2026-05-04 14:00:00,2026-05-05 16:00:00,2026-05-05 16:00:00,17,FRAME_A,blue,steel,tool_A,FRAME_A|blue|steel|tool_A
+ORD_016,MTO,5,low,2026-05-04 09:00:00,2026-05-06 08:00:00,2026-05-06 08:00:00,8,FRAME_B,red,aluminum,tool_B,FRAME_B|red|aluminum|tool_B
+ORD_017,MTO,3,high,2026-05-04 20:00:00,2026-05-06 02:00:00,2026-05-06 02:00:00,11,FRAME_A,blue,steel,tool_A,FRAME_A|blue|steel|tool_A
+ORD_018,MTO,1,critical,2026-05-04 14:00:00,2026-05-06 20:00:00,2026-05-06 20:00:00,13,KIT_D,black,plastic,tool_C,KIT_D|black|plastic|tool_C
+ORD_019,MTO,3,high,2026-05-04 14:00:00,2026-05-06 02:00:00,2026-05-06 02:00:00,7,FRAME_A,blue,steel,tool_A,FRAME_A|blue|steel|tool_A
+ORD_020,MTO,5,low,2026-05-04 14:00:00,2026-05-05 16:00:00,2026-05-05 16:00:00,12,FRAME_A,red,steel,tool_A,FRAME_A|red|steel|tool_A
