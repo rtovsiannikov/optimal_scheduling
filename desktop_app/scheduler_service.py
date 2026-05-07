@@ -78,6 +78,15 @@ class SchedulerService:
             tardiness_weight=settings.weights.tardiness_weight,
             makespan_weight=settings.weights.makespan_weight,
             preference_bonus=settings.weights.preference_bonus,
+        stability_change_penalty=settings.stability.stability_change_penalty,
+        stability_machine_change_penalty=settings.stability.stability_machine_change_penalty,
+        stability_start_shift_penalty=settings.stability.stability_start_shift_penalty,
+        stability_start_tolerance_minutes=settings.stability.stability_start_tolerance_minutes,
+        max_changed_operations=(
+            settings.stability.max_changed_operations
+            if settings.stability.max_changed_operations > 0
+            else None
+        ),
         )
         bundle = self.load_bundle(bundle_dir)
         return self._enrich_run(
@@ -112,6 +121,15 @@ class SchedulerService:
             tardiness_weight=settings.weights.tardiness_weight,
             makespan_weight=settings.weights.makespan_weight,
             preference_bonus=settings.weights.preference_bonus,
+        stability_change_penalty=settings.stability.stability_change_penalty,
+        stability_machine_change_penalty=settings.stability.stability_machine_change_penalty,
+        stability_start_shift_penalty=settings.stability.stability_start_shift_penalty,
+        stability_start_tolerance_minutes=settings.stability.stability_start_tolerance_minutes,
+        max_changed_operations=(
+            settings.stability.max_changed_operations
+            if settings.stability.max_changed_operations > 0
+            else None
+        ),
         )
         bundle = self.load_bundle(bundle_dir)
         actual_replan_time = result.metadata.get("replan_time") if result.metadata else None
@@ -179,6 +197,15 @@ class SchedulerService:
                     tardiness_weight=effective_settings.weights.tardiness_weight,
                     makespan_weight=effective_settings.weights.makespan_weight,
                     preference_bonus=effective_settings.weights.preference_bonus,
+                stability_change_penalty=effective_settings.stability.stability_change_penalty,
+                stability_machine_change_penalty=effective_settings.stability.stability_machine_change_penalty,
+                stability_start_shift_penalty=effective_settings.stability.stability_start_shift_penalty,
+                stability_start_tolerance_minutes=effective_settings.stability.stability_start_tolerance_minutes,
+                max_changed_operations=(
+                    effective_settings.stability.max_changed_operations
+                    if effective_settings.stability.max_changed_operations > 0
+                    else None
+                ),
                 )
                 actual_replan_time = result.metadata.get("replan_time") if result.metadata else replan_time
             else:
@@ -195,6 +222,15 @@ class SchedulerService:
                     tardiness_weight=effective_settings.weights.tardiness_weight,
                     makespan_weight=effective_settings.weights.makespan_weight,
                     preference_bonus=effective_settings.weights.preference_bonus,
+                stability_change_penalty=effective_settings.stability.stability_change_penalty,
+                stability_machine_change_penalty=effective_settings.stability.stability_machine_change_penalty,
+                stability_start_shift_penalty=effective_settings.stability.stability_start_shift_penalty,
+                stability_start_tolerance_minutes=effective_settings.stability.stability_start_tolerance_minutes,
+                max_changed_operations=(
+                    effective_settings.stability.max_changed_operations
+                    if effective_settings.stability.max_changed_operations > 0
+                    else None
+                ),
                 )
                 actual_replan_time = None
 

@@ -41,7 +41,7 @@ from .compare_view import build_change_table, build_kpi_comparison, build_machin
 from .gantt_view import GanttView
 from .kpi_cards import KpiPanel
 from .legend_window import OrderLegendWindow
-from .models import AppState, ObjectiveWeights, SolverSettings
+from .models import AppState, ObjectiveWeights, SolverSettings, StabilitySettings
 from .scheduler_service import SchedulerService
 from .table_views import DataFrameTable
 
@@ -272,6 +272,19 @@ class MainWindow(QMainWindow):
         weights_layout.addRow("Makespan", self.makespan_spin)
         weights_layout.addRow("Preferred machine", self.preference_spin)
 
+        stability_group = QGroupBox("Rescheduling stability")
+        stability_layout = QFormLayout(stability_group)
+        self.stability_change_spin = self._make_int_spin(2_000, 0, 10_000_000, 500)
+        self.stability_machine_spin = self._make_int_spin(8_000, 0, 10_000_000, 500)
+        self.stability_shift_spin = self._make_int_spin(5, 0, 100_000, 1)
+        self.stability_tolerance_spin = self._make_int_spin(15, 0, 1_440, 5)
+        self.max_changed_ops_spin = self._make_int_spin(0, 0, 100_000, 1)
+        stability_layout.addRow("Changed operation", self.stability_change_spin)
+        stability_layout.addRow("Machine change", self.stability_machine_spin)
+        stability_layout.addRow("Start shift / minute", self.stability_shift_spin)
+        stability_layout.addRow("Start tolerance, min", self.stability_tolerance_spin)
+        stability_layout.addRow("Max changed ops (0 = off)", self.max_changed_ops_spin)
+
         actions_group = QGroupBox("Actions")
         actions_layout = QVBoxLayout(actions_group)
         self.solve_button = QPushButton("Solve baseline plan")
@@ -305,6 +318,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(data_group)
         layout.addWidget(solver_group)
         layout.addWidget(weights_group)
+        layout.addWidget(stability_group)
         layout.addWidget(actions_group)
         layout.addStretch(1)
         return panel
@@ -647,12 +661,20 @@ class MainWindow(QMainWindow):
             makespan_weight=int(self.makespan_spin.value()),
             preference_bonus=int(self.preference_spin.value()),
         )
+        stability = StabilitySettings(
+            stability_change_penalty=int(self.stability_change_spin.value()),
+            stability_machine_change_penalty=int(self.stability_machine_spin.value()),
+            stability_start_shift_penalty=int(self.stability_shift_spin.value()),
+            stability_start_tolerance_minutes=int(self.stability_tolerance_spin.value()),
+            max_changed_operations=int(self.max_changed_ops_spin.value()),
+        )
         return SolverSettings(
             time_limit_seconds=float(self.time_limit_spin.value()),
             num_search_workers=int(self.workers_spin.value()),
             use_actual_downtime=bool(self.actual_downtime_check.isChecked()),
             freeze_started_operations=bool(self.freeze_started_check.isChecked()),
             weights=weights,
+            stability=stability,
         )
 
     def _require_bundle(self) -> bool:

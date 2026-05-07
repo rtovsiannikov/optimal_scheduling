@@ -21,6 +21,17 @@ class ObjectiveWeights:
 
 
 @dataclass
+class StabilitySettings:
+    """Rescheduling stability settings passed into the CP-SAT scheduler."""
+
+    stability_change_penalty: int = 2_000
+    stability_machine_change_penalty: int = 8_000
+    stability_start_shift_penalty: int = 5
+    stability_start_tolerance_minutes: int = 15
+    max_changed_operations: int = 0
+
+
+@dataclass
 class SolverSettings:
     """Solver runtime settings controlled from the UI."""
 
@@ -30,6 +41,7 @@ class SolverSettings:
     freeze_started_operations: bool = True
     log_search_progress: bool = False
     weights: ObjectiveWeights = field(default_factory=ObjectiveWeights)
+    stability: StabilitySettings = field(default_factory=StabilitySettings)
 
 
 @dataclass
