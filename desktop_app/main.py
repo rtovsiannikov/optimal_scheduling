@@ -53,8 +53,8 @@ QMainWindow {
 QGroupBox {
     border: 1px solid #d8dee8;
     border-radius: 12px;
-    margin-top: 10px;
-    padding: 10px;
+    margin-top: 8px;
+    padding: 8px;
     background: #ffffff;
     font-weight: 700;
 }
@@ -185,7 +185,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._build_main_area())
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([360, 1140])
+        splitter.setSizes([320, 1180])
         root_layout.addWidget(splitter, stretch=1)
 
         self.setCentralWidget(root)
@@ -211,16 +211,20 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Status: —")
         self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        layout.addWidget(title, stretch=2)
-        layout.addWidget(self.bundle_label, stretch=2)
-        layout.addWidget(self.status_label, stretch=1)
+        # Keep the title dominant and render dataset/status as compact right-side chips.
+        self.bundle_label.setStyleSheet("color: #334155; padding: 3px 8px;")
+        self.status_label.setStyleSheet("color: #334155; padding: 3px 8px;")
+        layout.addWidget(title, stretch=0)
+        layout.addStretch(1)
+        layout.addWidget(self.bundle_label, stretch=0)
+        layout.addWidget(self.status_label, stretch=0)
         return box
 
     def _build_sidebar(self) -> QWidget:
         panel = QWidget()
-        panel.setMinimumWidth(320)
-        panel.setMaximumWidth(420)
-        panel.setMinimumHeight(920)
+        # Keep the sidebar compact; the outer QScrollArea handles vertical overflow.
+        panel.setMinimumWidth(300)
+        panel.setMaximumWidth(360)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 8, 0)
         layout.setSpacing(8)
@@ -248,9 +252,11 @@ class MainWindow(QMainWindow):
         self.time_limit_spin.setRange(1.0, 600.0)
         self.time_limit_spin.setValue(20.0)
         self.time_limit_spin.setSingleStep(5.0)
+        self.time_limit_spin.setFixedWidth(118)
         self.workers_spin = QSpinBox()
         self.workers_spin.setRange(1, 64)
         self.workers_spin.setValue(8)
+        self.workers_spin.setFixedWidth(118)
         self.actual_downtime_check = QCheckBox("Use actual downtime")
         self.freeze_started_check = QCheckBox("Freeze started operations")
         self.freeze_started_check.setChecked(True)
@@ -260,30 +266,36 @@ class MainWindow(QMainWindow):
         solver_layout.addRow(self.freeze_started_check)
 
         weights_group = QGroupBox("Objective weights")
-        weights_layout = QFormLayout(weights_group)
+        weights_layout = QGridLayout(weights_group)
+        weights_layout.setHorizontalSpacing(8)
+        weights_layout.setVerticalSpacing(6)
         self.missed_otif_spin = self._make_int_spin(100_000, 0, 10_000_000, 10_000)
         self.missed_qty_spin = self._make_int_spin(1_000, 0, 1_000_000, 100)
         self.tardiness_spin = self._make_int_spin(100, 0, 100_000, 10)
         self.makespan_spin = self._make_int_spin(1, 0, 10_000, 1)
         self.preference_spin = self._make_int_spin(5, 0, 10_000, 1)
-        weights_layout.addRow("Missed OTIF", self.missed_otif_spin)
-        weights_layout.addRow("Missed quantity", self.missed_qty_spin)
-        weights_layout.addRow("Tardiness", self.tardiness_spin)
-        weights_layout.addRow("Makespan", self.makespan_spin)
-        weights_layout.addRow("Preferred machine", self.preference_spin)
+        self._add_compact_setting(weights_layout, 0, "Missed OTIF", self.missed_otif_spin)
+        self._add_compact_setting(weights_layout, 1, "Missed quantity", self.missed_qty_spin)
+        self._add_compact_setting(weights_layout, 2, "Tardiness", self.tardiness_spin)
+        self._add_compact_setting(weights_layout, 3, "Makespan", self.makespan_spin)
+        self._add_compact_setting(weights_layout, 4, "Preferred machine", self.preference_spin)
+        weights_layout.setColumnStretch(0, 1)
 
         stability_group = QGroupBox("Rescheduling stability")
-        stability_layout = QFormLayout(stability_group)
+        stability_layout = QGridLayout(stability_group)
+        stability_layout.setHorizontalSpacing(8)
+        stability_layout.setVerticalSpacing(6)
         self.stability_change_spin = self._make_int_spin(2_000, 0, 10_000_000, 500)
         self.stability_machine_spin = self._make_int_spin(8_000, 0, 10_000_000, 500)
         self.stability_shift_spin = self._make_int_spin(5, 0, 100_000, 1)
         self.stability_tolerance_spin = self._make_int_spin(15, 0, 1_440, 5)
         self.max_changed_ops_spin = self._make_int_spin(0, 0, 100_000, 1)
-        stability_layout.addRow("Changed operation", self.stability_change_spin)
-        stability_layout.addRow("Machine change", self.stability_machine_spin)
-        stability_layout.addRow("Start shift / minute", self.stability_shift_spin)
-        stability_layout.addRow("Start tolerance, min", self.stability_tolerance_spin)
-        stability_layout.addRow("Max changed ops (0 = off)", self.max_changed_ops_spin)
+        self._add_compact_setting(stability_layout, 0, "Changed op", self.stability_change_spin)
+        self._add_compact_setting(stability_layout, 1, "Machine change", self.stability_machine_spin)
+        self._add_compact_setting(stability_layout, 2, "Shift / min", self.stability_shift_spin)
+        self._add_compact_setting(stability_layout, 3, "Tolerance, min", self.stability_tolerance_spin)
+        self._add_compact_setting(stability_layout, 4, "Max changed, 0=off", self.max_changed_ops_spin)
+        stability_layout.setColumnStretch(0, 1)
 
         actions_group = QGroupBox("Actions")
         actions_layout = QVBoxLayout(actions_group)
@@ -324,11 +336,19 @@ class MainWindow(QMainWindow):
         return panel
 
     @staticmethod
+    def _add_compact_setting(layout: QGridLayout, row: int, label_text: str, editor: QWidget) -> None:
+        label = QLabel(label_text)
+        label.setStyleSheet("color: #111827;")
+        layout.addWidget(label, row, 0)
+        layout.addWidget(editor, row, 1, alignment=Qt.AlignRight)
+
+    @staticmethod
     def _make_int_spin(value: int, minimum: int, maximum: int, step: int) -> QSpinBox:
         spin = QSpinBox()
         spin.setRange(minimum, maximum)
         spin.setSingleStep(step)
         spin.setValue(value)
+        spin.setFixedWidth(118)
         return spin
 
     def _build_main_area(self) -> QWidget:
