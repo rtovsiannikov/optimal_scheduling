@@ -15,60 +15,110 @@ def write_gantt_view() -> None:
     print(f"Wrote {GANTT_PATH}")
 
 
-def patch_main_for_order_deadlines_and_shifts() -> None:
-    """Patch all Gantt calls so the chart receives order context.
+def _find_matching_paren(text: str, open_paren_index: int) -> int:
+    """Return the matching ')' for text[open_paren_index] == '('."""
+    depth = 0
+    quote = None
+    escaped = False
+    i = open_paren_index
+    while i < len(text):
+        ch = text[i]
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == quote:
+                quote = None
+        else:
+            if ch in {"'", '"'}:
+                quote = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    return i
+        i += 1
+    return -1
 
-    The manager Gantt can draw priority colors, deadline markers and shift
-    backgrounds only when main.py passes run.order_summary and bundle.shifts.
-    This function intentionally uses several compact-pattern replacements
-    because the repository currently stores main.py mostly as long lines.
+
+def _patch_single_plot_call(call: str) -> str:
+    """Add order_summary_df and shifts_df to one GanttView.plot_schedule call."""
+    if "order_summary_df=" in call and "shifts_df=" in call:
+        return call
+    if "run.schedule" not in call:
+        return call
+
+    extras = (
+        "order_summary_df=run.order_summary, "
+        "shifts_df=self.state.bundle.shifts if self.state.bundle is not None else None, "
+    )
+
+    marker = "run.schedule,"
+    idx = call.find(marker)
+    if idx != -1:
+        insert_at = idx + len(marker)
+        return call[:insert_at] + " " + extras + call[insert_at:]
+
+    marker = "plot_schedule("
+    idx = call.find(marker)
+    if idx != -1:
+        insert_at = idx + len(marker)
+        return call[:insert_at] + extras + call[insert_at:]
+    return call
+
+
+def patch_main_for_order_deadlines_and_shifts() -> None:
+    """Patch every Gantt plot call so deadline/fill/priority layers receive order context.
+
+    The previous patch used exact string replacements and could miss calls in
+    desktop_app/main.py. This version scans every .plot_schedule(...) call,
+    balances parentheses, and injects order_summary_df and shifts_df into
+    baseline, rescheduled, what-if and highlight refresh calls.
     """
     if not MAIN_PATH.exists():
         print(f"WARNING: {MAIN_PATH} not found; Gantt view will still work without deadline/shift extras.")
         return
 
     text = MAIN_PATH.read_text(encoding="utf-8")
-    original = text
-    extras = "order_summary_df=run.order_summary, shifts_df=self.state.bundle.shifts if self.state.bundle is not None else None, "
+    out = []
+    pos = 0
+    patched = 0
+    already_ok = 0
 
-    replacements = [
-        (
-            'title="Baseline production schedule", color_map=',
-            'title="Baseline production schedule", ' + extras + 'color_map=',
-        ),
-        (
-            'title=f"Rescheduled production plan: {scenario_name}", downtime_df=',
-            'title=f"Rescheduled production plan: {scenario_name}", ' + extras + 'downtime_df=',
-        ),
-        (
-            'title="Recommendation what-if plan", downtime_df=',
-            'title="Recommendation what-if plan", ' + extras + 'downtime_df=',
-        ),
-        (
-            'title=title, downtime_df=',
-            'title=title, ' + extras + 'downtime_df=',
-        ),
-        (
-            'title=title, color_map=',
-            'title=title, ' + extras + 'color_map=',
-        ),
-    ]
+    token = ".plot_schedule("
+    while True:
+        idx = text.find(token, pos)
+        if idx == -1:
+            out.append(text[pos:])
+            break
+        open_idx = text.find("(", idx)
+        close_idx = _find_matching_paren(text, open_idx)
+        if close_idx == -1:
+            out.append(text[pos:])
+            break
 
-    for old, new in replacements:
-        if old in text and new not in text:
-            text = text.replace(old, new)
+        out.append(text[pos:idx])
+        call = text[idx:close_idx + 1]
+        new_call = _patch_single_plot_call(call)
+        if new_call != call:
+            patched += 1
+        elif "order_summary_df=" in call and "shifts_df=" in call:
+            already_ok += 1
+        out.append(new_call)
+        pos = close_idx + 1
 
-    text = text.replace(extras + extras, extras)
-
-    if text != original:
-        MAIN_PATH.write_text(text, encoding="utf-8")
-        print(f"Patched {MAIN_PATH}: Gantt receives order_summary_df and shifts_df")
+    new_text = "".join(out)
+    if new_text != text:
+        MAIN_PATH.write_text(new_text, encoding="utf-8")
+        print(f"Patched {MAIN_PATH}: updated {patched} Gantt plot_schedule call(s).")
     else:
-        print("No main.py changes were made. It may already be patched, or the call patterns changed.")
-        if "order_summary_df=run.order_summary" not in text:
-            print("WARNING: order_summary_df is still missing; Priority/Deadline/Shift layers may not work.")
+        print(f"No main.py changes were made. Already patched calls: {already_ok}.")
 
-
+    final = MAIN_PATH.read_text(encoding="utf-8")
+    if "order_summary_df=run.order_summary" not in final or "shifts_df=self.state.bundle.shifts" not in final:
+        print("WARNING: main.py still does not pass order_summary_df/shifts_df. Deadline, fill-rate and priority layers may be unavailable.")
 
 def main() -> None:
     write_gantt_view()
