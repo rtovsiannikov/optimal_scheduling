@@ -5,7 +5,7 @@ This widget keeps the public API used by the existing application, but adds
 production-manager features on top of the old chart:
 
 * color modes: by order, status, machine group, priority;
-* quick filters: late/partial orders, changed operations, machine group, order id;
+* quick filters: OTIF failures, changed operations, machine group, order id;
 * hover tooltip for every operation;
 * deadline markers for failed/selected orders;
 * working-shift background bands;
@@ -46,7 +46,6 @@ ORDER_PALETTE = [
 STATUS_COLORS = {
     "normal": "#2563eb",
     "late": "#dc2626",
-    "partial": "#f59e0b",
     "changed": "#7c3aed",
     "selected": "#0f172a",
     "setup": "#cbd5e1",
@@ -350,6 +349,14 @@ class GanttView(QWidget):
 
     @staticmethod
     def _attach_order_summary(schedule: pd.DataFrame, order_summary_df: Optional[pd.DataFrame]) -> pd.DataFrame:
+        """Attach order-level business context to operation rows.
+
+        The raw schedule may already contain placeholder columns such as
+        deadline/fill_rate_by_deadline. When pandas merges duplicated column
+        names it creates *_order suffixes. This function always promotes the
+        order-summary values back to the plain column names, so tooltips,
+        deadline markers and priority colors work reliably.
+        """
         if order_summary_df is None or order_summary_df.empty or "order_id" not in order_summary_df.columns:
             return schedule
         summary = order_summary_df.copy()
@@ -363,6 +370,7 @@ class GanttView(QWidget):
             "completed_quantity_by_deadline",
             "fill_rate_by_deadline",
             "priority",
+            "priority_label",
             "priority_weight",
             "otif",
             "on_time",
@@ -374,6 +382,18 @@ class GanttView(QWidget):
         if len(cols) <= 1:
             return schedule
         out = schedule.merge(summary[cols].drop_duplicates("order_id"), on="order_id", how="left", suffixes=("", "_order"))
+        for col in cols:
+            if col == "order_id":
+                continue
+            order_col = f"{col}_order"
+            if order_col in out.columns:
+                if col in out.columns:
+                    # Prefer the order summary value when it exists. This fixes
+                    # blank deadline/fill-rate tooltips caused by merge suffixes.
+                    out[col] = out[order_col].where(out[order_col].notna(), out[col])
+                else:
+                    out[col] = out[order_col]
+                out = out.drop(columns=[order_col])
         for col in ["promised_date", "deadline", "completion_time"]:
             if col in out.columns:
                 out[col] = pd.to_datetime(out[col], errors="coerce")
@@ -599,10 +619,11 @@ class GanttView(QWidget):
         width = max(end - start, 1.0 / (24 * 60))
         y = y_positions[machine]
         is_changed = op_id in changed_ops
-        is_late = order_id in late_orders or self._bool_value(row.get("otif")) is False
-        is_partial = order_id in partial_orders or self._bool_value(row.get("in_full")) is False
+        is_late = order_id in late_orders or self._bool_value(self._row_value(row, "otif")) is False
+        is_partial = order_id in partial_orders or self._bool_value(self._row_value(row, "in_full")) is False
+        has_otif_fail = is_late or is_partial
         is_highlighted = highlighted is not None and order_id == str(highlighted)
-        status = "late" if is_late else "partial" if is_partial else "changed" if is_changed else "normal"
+        status = "late" if has_otif_fail else "changed" if is_changed else "normal"
         if is_highlighted:
             status = "selected"
 
@@ -612,12 +633,9 @@ class GanttView(QWidget):
         if is_changed:
             edgecolor = "#4c1d95"
             linewidth = 1.8
-        if is_late:
+        if has_otif_fail:
             edgecolor = "#7f1d1d"
             linewidth = 2.0
-        if is_partial and not is_late:
-            edgecolor = "#92400e"
-            linewidth = 1.7
         if is_highlighted:
             edgecolor = "#facc15"
             linewidth = 3.0
@@ -653,7 +671,7 @@ class GanttView(QWidget):
                 zorder=6,
             )
         if final_operation_ids.get(order_id) == op_id:
-            self._draw_order_status_marker(ax, row, y, y_height, is_late=is_late, is_partial=is_partial)
+            self._draw_order_status_marker(ax, row, y, y_height, has_otif_fail=has_otif_fail)
 
     @staticmethod
     def _operation_color(row: pd.Series, order_to_color: Dict[str, str], status: str, color_mode: str) -> str:
@@ -664,6 +682,18 @@ class GanttView(QWidget):
             group = str(row.get("machine_group_required", ""))
             return MACHINE_GROUP_COLORS.get(group, "#64748b")
         if color_mode == "priority":
+            # Prefer business priority labels when they are available. In the demo data
+            # priority_label is high / normal / low, while priority_weight is the
+            # internal solver weight. Both are supported here.
+            label = str(row.get("priority_label", "")).strip().lower()
+            if label in {"critical", "urgent"}:
+                return "#dc2626"
+            if label == "high":
+                return "#f59e0b"
+            if label == "normal":
+                return "#2563eb"
+            if label == "low":
+                return "#94a3b8"
             priority = pd.to_numeric(pd.Series([row.get("priority_weight", row.get("priority", 1))]), errors="coerce").iloc[0]
             try:
                 priority = float(priority)
@@ -673,26 +703,53 @@ class GanttView(QWidget):
                 return "#dc2626"
             if priority >= 3:
                 return "#f59e0b"
+            if priority <= 1:
+                return "#94a3b8"
             return "#2563eb"
         return STATUS_COLORS.get(status, STATUS_COLORS["normal"])
 
     @staticmethod
-    def _draw_order_status_marker(ax, row, y: float, y_height: float, *, is_late: bool, is_partial: bool) -> None:
+    def _draw_order_status_marker(ax, row, y: float, y_height: float, *, has_otif_fail: bool) -> None:
+        if not has_otif_fail:
+            return
         end = date2num(row["end_time"])
         marker_y = y + y_height + 0.8
-        if is_late:
-            ax.scatter(end, marker_y, marker="v", s=58, color="#dc2626", edgecolors="#111827", linewidths=0.4, zorder=8)
-            ax.text(end, marker_y + 0.9, "OTIF fail", ha="right", va="bottom", fontsize=7, color="#dc2626", zorder=8)
-        elif is_partial:
-            ax.scatter(end, marker_y, marker="D", s=44, color="#f59e0b", edgecolors="#111827", linewidths=0.4, zorder=8)
-            ax.text(end, marker_y + 0.9, "partial", ha="right", va="bottom", fontsize=7, color="#b45309", zorder=8)
+        ax.scatter(end, marker_y, marker="v", s=58, color="#dc2626", edgecolors="#111827", linewidths=0.4, zorder=8)
+        ax.text(end, marker_y + 0.9, "OTIF fail", ha="right", va="bottom", fontsize=7, color="#dc2626", zorder=8)
 
     @staticmethod
-    def _row_deadline(row: pd.Series) -> Optional[pd.Timestamp]:
-        for key in ["promised_date", "deadline"]:
-            if key in row and not pd.isna(row[key]):
-                return pd.to_datetime(row[key], errors="coerce")
-        return None
+    def _is_useful_value(value) -> bool:
+        if value is None:
+            return False
+        try:
+            if pd.isna(value):
+                return False
+        except Exception:
+            pass
+        text = str(value).strip().lower()
+        return text not in {"", "nan", "nat", "none", "null"}
+
+    @classmethod
+    def _row_value(cls, row: pd.Series, *keys: str, default=None):
+        for key in keys:
+            for candidate in (key, f"{key}_order"):
+                if candidate in row.index:
+                    value = row.get(candidate)
+                    if cls._is_useful_value(value):
+                        return value
+        return default
+
+    @classmethod
+    def _row_deadline(cls, row: pd.Series) -> Optional[pd.Timestamp]:
+        # Business users usually mean the committed deadline first. If a
+        # dataset only has promised_date, use it as a fallback.
+        value = cls._row_value(row, "deadline", "promised_date")
+        if value is None:
+            return None
+        deadline = pd.to_datetime(value, errors="coerce")
+        if pd.isna(deadline):
+            return None
+        return deadline
 
     @staticmethod
     def _bool_value(value) -> Optional[bool]:
@@ -739,9 +796,20 @@ class GanttView(QWidget):
             if deadline is None or pd.isna(deadline):
                 continue
             x = date2num(deadline)
-            color = "#dc2626" if str(order_id) in late_order_ids else "#f59e0b"
-            ax.axvline(x, color=color, linestyle="--", linewidth=1.1, alpha=0.75, zorder=2)
-            ax.text(x, ymax + 1.2, f"deadline\n{order_id}", ha="center", va="bottom", fontsize=7, color=color, zorder=8)
+            is_failed = str(order_id) in late_order_ids or str(order_id) in partial_order_ids
+            color = "#dc2626" if is_failed else "#0f172a"
+            ax.axvline(x, color=color, linestyle="--", linewidth=1.5, alpha=0.85, zorder=7)
+            ax.text(
+                x,
+                ymax + 1.2,
+                f"deadline\n{order_id}",
+                ha="center",
+                va="bottom",
+                fontsize=7,
+                color=color,
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec=color, alpha=0.85),
+                zorder=9,
+            )
             drawn = True
         return drawn
 
@@ -847,10 +915,8 @@ class GanttView(QWidget):
             Patch(facecolor=STATUS_COLORS["normal"], edgecolor="#ffffff", label="Normal operation"),
             Patch(facecolor="#ecfdf5", edgecolor="none", label="Working shift background"),
         ]
-        if late_orders:
-            handles.append(Patch(facecolor=STATUS_COLORS["late"], edgecolor="#7f1d1d", label="OTIF failed / late order"))
-        if partial_orders:
-            handles.append(Patch(facecolor=STATUS_COLORS["partial"], edgecolor="#92400e", label="Not in-full / partial"))
+        if late_orders or partial_orders:
+            handles.append(Patch(facecolor=STATUS_COLORS["late"], edgecolor="#7f1d1d", label="OTIF failed / late / not in-full"))
         if changed_ops:
             handles.append(Patch(facecolor=STATUS_COLORS["changed"], edgecolor="#4c1d95", label="Changed vs baseline"))
             handles.append(Patch(facecolor="#94a3b8", edgecolor="#334155", alpha=0.25, hatch="//", label="Baseline ghost"))
@@ -906,9 +972,12 @@ class GanttView(QWidget):
         end = pd.to_datetime(row.get("end_time"))
         duration = (end - start).total_seconds() / 60.0 if not pd.isna(start) and not pd.isna(end) else 0.0
         deadline = item.deadline.strftime("%m-%d %H:%M") if item.deadline is not None and not pd.isna(item.deadline) else "—"
-        fill = row.get("fill_rate_by_deadline", "")
+        fill = GanttView._row_value(row, "fill_rate_by_deadline")
         try:
-            fill_text = f"{100.0 * float(fill):.1f}%"
+            fill_value = float(fill)
+            if fill_value <= 1.5:
+                fill_value *= 100.0
+            fill_text = f"{fill_value:.1f}%"
         except Exception:
             fill_text = "—"
         bits = [
